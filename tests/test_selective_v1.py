@@ -120,3 +120,10 @@ def test_original_model_does_not_train_when_v1_train():
     model = PULSESelectiveV1(MiniPULSE()).train()
     assert all(not p.requires_grad for p in model.base.decoder.core.parameters())
     assert all(p.requires_grad for p in model.base.decoder.enhancers.parameters())
+
+
+def test_256_channel_enhancers_remain_lightweight():
+    decoder = SelectiveDPTDecoder(MiniDecoder(8), channels=8)
+    assert sum(p.numel() for p in decoder.enhancers.parameters()) > 0
+    big = MultiscaleSelectiveEnhancement(256, 64)
+    assert sum(p.numel() for p in big.parameters()) < 60000
