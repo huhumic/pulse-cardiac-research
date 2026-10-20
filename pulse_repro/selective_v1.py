@@ -24,28 +24,29 @@ class MultiscaleSelectiveEnhancement(nn.Module):
         super().__init__()
         if channels <= 0 or hidden <= 0:
             raise ValueError("channels and hidden must be positive")
-        groups = math.gcd(channels, 16)
+        norm_groups = math.gcd(channels, 16)
+        proj_groups = math.gcd(math.gcd(channels, hidden), 8)
         self.edge_depthwise = nn.Conv2d(
             2 * channels, 2 * channels, 3, padding=1, groups=2 * channels,
             bias=False
         )
         self.edge_project = nn.Sequential(
-            nn.Conv2d(2 * channels, channels, 1, bias=False),
-            nn.GroupNorm(groups, channels), nn.GELU()
+            nn.Conv2d(2 * channels, channels, 1, groups=proj_groups, bias=False),
+            nn.GroupNorm(norm_groups, channels), nn.GELU()
         )
         self.context = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=2, dilation=2,
                       groups=channels, bias=False),
-            nn.Conv2d(channels, channels, 1),
+            nn.Conv2d(channels, channels, 1, groups=proj_groups),
             nn.GELU()
         )
         self.state_gate = nn.Sequential(
-            nn.Conv2d(2 * channels, hidden, 1),
+            nn.Conv2d(2 * channels, hidden, 1, groups=proj_groups),
             nn.GELU(),
-            nn.Conv2d(hidden, channels, 1),
+            nn.Conv2d(hidden, channels, 1, groups=proj_groups),
             nn.Sigmoid()
         )
-        self.update = nn.Conv2d(channels, channels, 1)
+        self.update = nn.Conv2d(channels, channels, 1, groups=proj_groups)
         # Identity at initialization: official PULSE prediction is unchanged.
         nn.init.zeros_(self.update.weight)
         nn.init.zeros_(self.update.bias)
