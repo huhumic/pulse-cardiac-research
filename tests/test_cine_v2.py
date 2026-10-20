@@ -12,7 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from pulse_repro.cine_data import (
-    build_temporal_input, find_cine, neighboring_indices
+    build_temporal_input, find_cine, neighboring_indices, phase_context,
+    _phase_similarity
 )
 from pulse_repro.cine_v2 import (
     BidirectionalEvidenceFusion, PULSECineReliabilityV2,
@@ -36,7 +37,8 @@ def test_build_temporal_source_is_time_not_spatial():
             yy,xx=np.mgrid[:h,:w]
             cine[...,zi,ti]=3*xx + zi*yy+ti*(xx+yy*2)**2/20
     target=cine[...,2].copy()
-    spatial,temporals=build_temporal_input(target,cine,1,frame=3,size=32)
+    spatial,temporals,phase=build_temporal_input(target,cine,1,frame=3,ed_frame=1,size=32)
+    np.testing.assert_allclose(phase,phase_context(3,6,1))
     assert spatial.shape==(3,32,32)
     assert temporals.shape==(2,32,32)
     assert not np.allclose(temporals[0],temporals[1])
@@ -54,7 +56,8 @@ def test_four_d_missing_is_a_hard_error(tmp_path):
 def test_zero_offset_feature_warp_is_identity():
     image=torch.rand(2,5,11,13)
     grid=torch.zeros((2,2,11,13))
-    got=warp_2d(image,grid)
+    got,mask=warp_2d(image,grid,return_valid=True)
+    assert bool(mask.all())
     torch.testing.assert_close(got,image,rtol=2e-5,atol=2e-6)
     with pytest.raises(ValueError):warp_2d(image,grid[:,:,:-1])
 
@@ -64,10 +67,12 @@ def test_bidirectional_fusion_well_formed_and_zero_init():
     block=BidirectionalEvidenceFusion(decoder_channels=8,temporal_channels=8)
     img=torch.rand(2,1,24,24)
     neighbors=torch.rand(2,2,24,24)
-    delta,aux=block(img,neighbors,(8,8))
+    phase=torch.tensor([[0.,1.,.05]]).repeat(2,1)
+    delta,aux=block(img,neighbors,(8,8),phase)
     assert delta.shape==(2,8,8,8)
     assert delta.abs().max().item()==0.
     assert aux["weights"].shape==(2,3,8,8)
+    assert aux["valid_minus"].shape == (2,1,8,8)
     torch.testing.assert_close(aux["weights"].sum(1),torch.ones(2,8,8),atol=1e-6,rtol=1e-6)
     assert aux["probe_minus"].shape==(2,4,8,8)
     (delta.square().mean()+aux["probe_minus"].mean()).backward()
@@ -156,13 +161,14 @@ def test_v2_initial_logits_near_original_pulse_and_backward():
     model=PULSECineReliabilityV2(src,use_structure=True).eval()
     x=torch.rand(2,3,16,16)
     t=torch.rand(2,2,16,16)
+    phase=torch.tensor([[.2,.98,.05]],dtype=torch.float32).repeat(2,1)
     with torch.no_grad():
         expected=ref(x)
-        actual=model(x,t)
+        actual=model(x,t,phase)
     for a,b in zip(expected,actual):
         torch.testing.assert_close(a,b,rtol=1e-5,atol=1e-6)
     model.train()
-    scores=model(x,t,return_aux=True)
+    scores=model(x,t,phase,return_aux=True)
     loss=F.cross_entropy(scores[0],torch.randint(0,4,(2,64,64)))
     loss=loss+.1*reliable_agreement_loss(scores[3],scores[0],threshold=0.)
     loss.backward()
@@ -175,4 +181,66 @@ def test_v2_initial_logits_near_original_pulse_and_backward():
 def test_temporal_shape_violation():
     model=PULSECineReliabilityV2(MiniPulse())
     with pytest.raises(ValueError,match="B2HW"):
-        model(torch.randn(1,3,16,16),torch.randn(1,3,16,16))
+        model(torch.randn(1,3,16,16),torch.randn(1,3,16,16),torch.tensor([[0.,1.,.05]]))
+
+
+def test_temporal_swap_changes_direction_conditioned_evidence_after_training():
+    torch.manual_seed(9)
+    block = BidirectionalEvidenceFusion(decoder_channels=8,temporal_channels=8)
+    with torch.no_grad():
+        block.to_decoder.weight.normal_(0,.05)
+        # Controlled non-zero direction signal: proves the architecture can
+        # distinguish chronological order, not that an untrained network does.
+        block.direction_embed[0].fill_(.5)
+        block.direction_embed[1].fill_(-.5)
+    target=torch.rand(1,1,32,32)
+    neighbors=torch.rand(1,2,32,32)
+    phase=torch.tensor([[.5,.866,.05]])
+    a,_=block(target,neighbors,(16,16),phase)
+    b,_=block(target,neighbors.flip(1),(16,16),phase)
+    assert (a-b).abs().max().item()>1e-6
+
+
+def test_invalid_warp_locations_are_explicitly_rejected():
+    image=torch.rand(1,3,9,9)
+    offsets=torch.zeros(1,2,9,9)
+    offsets[:,0]+=5.0
+    shifted,valid=warp_2d(image,offsets,return_valid=True)
+    assert (~valid).any() and valid.any()
+    assert (shifted*~valid).abs().max()==0
+
+
+def test_true_phase_correlation_and_wrong_time_frame():
+    rng=np.random.default_rng(6)
+    image=rng.normal(size=(12,10,4)).astype(np.float32)
+    assert _phase_similarity(image,2*image+12)>0.9999
+    other=rng.normal(size=(12,10,4)).astype(np.float32)
+    assert _phase_similarity(image,other)<.8
+
+
+def test_no_temporal_ablation_is_independent_of_neighbors():
+    torch.manual_seed(5)
+    model=PULSECineReliabilityV2(MiniPulse(),use_temporal=False)
+    x=torch.randn(1,3,16,16)
+    phase=torch.tensor([[.0,1.,.05]])
+    with torch.no_grad():
+        one=model.eval()(x,torch.zeros(1,2,16,16),phase)[0]
+        two=model.eval()(x,torch.rand(1,2,16,16),phase)[0]
+    torch.testing.assert_close(one,two,atol=0,rtol=0)
+
+
+def test_direction_is_required_and_invalid_phase_rejected():
+    blk=BidirectionalEvidenceFusion(8,8)
+    with pytest.raises(ValueError,match="phase_context"):
+        blk(torch.rand(1,1,16,16),torch.rand(1,2,16,16),(8,8),torch.zeros(1,2))
+    with pytest.raises(ValueError,match="Invalid"):
+        blk(torch.rand(1,1,16,16),torch.rand(1,2,16,16),(8,8),torch.zeros(1,3))
+
+
+def test_cine_phase_is_ed_anchored_not_file_start():
+    np.testing.assert_allclose(phase_context(6,20,6),
+        [0.,1.,.05],atol=1e-6)
+    np.testing.assert_allclose(phase_context(7,20,7),
+        [0.,1.,.05],atol=1e-6)
+    np.testing.assert_allclose(phase_context(9,20,6),
+        phase_context(11,20,8),atol=1e-6)

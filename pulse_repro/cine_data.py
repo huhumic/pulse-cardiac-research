@@ -55,32 +55,109 @@ def raw_root(normalized_root: Path) -> Path:
     return path
 
 
+def _phase_similarity(phase_volume: np.ndarray, cine_frame: np.ndarray) -> float:
+    """Intensity-affine invariant Pearson correlation. Fail closed on flat data."""
+    x = np.asarray(phase_volume, dtype=np.float32).ravel()[::max(1, phase_volume.size // 80000)]
+    y = np.asarray(cine_frame, dtype=np.float32).ravel()[::max(1, cine_frame.size // 80000)]
+    if x.shape != y.shape or x.size < 100 or not (np.isfinite(x).all() and np.isfinite(y).all()):
+        raise ValueError("Invalid/non-finite voxel samples when checking cine phase")
+    x = x.astype(np.float64); y = y.astype(np.float64)
+    x -= x.mean(); y -= y.mean()
+    nx = np.linalg.norm(x); ny = np.linalg.norm(y)
+    if nx < 1e-8 or ny < 1e-8:
+        raise ValueError("Constant image prevents ED/ES-to-cine identity check")
+    return float(np.dot(x, y) / (nx * ny))
+
+
+def verify_patient_cine(original: Path, normalized_root: Path,
+                        min_ncc: float = .995) -> dict:
+    """Verify ED/ES files really match their Info.cfg time indices in 4D.
+
+    Check normalized images (the actual inputs to PULSE), matching GT masks,
+    geometry, NbFrame and correlations against the declared and adjacent time
+    indices. We avoid assuming 3D files are *bitwise* identical to 4D frames:
+    mild affine intensity scaling is allowed, wrong phase is not.
+    """
+    nib = _nib()
+    raw_pdir = original
+    pdir = normalized_root / "training" / original.name
+    info = {}
+    for line in (original / "Info.cfg").read_text(encoding="utf-8").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            info[k.strip()] = v.strip()
+    for key in ("ED", "ES", "NbFrame"):
+        if key not in info:
+            raise ValueError(f"Missing {key} in {original/'Info.cfg'}")
+    path = find_cine(raw_pdir)
+    cine_nii = nib.load(str(path))
+    shape = cine_nii.shape
+    if len(shape) != 4 or min(shape[:3]) < 2 or shape[3] < 3:
+        raise ValueError(f"Invalid 4D cine dimensions: {shape}")
+    if int(info["NbFrame"]) != shape[3]:
+        raise ValueError(f"NbFrame={info['NbFrame']} does not match 4D T={shape[3]}")
+    diagnostics = {}
+    for phase in ("ED", "ES"):
+        frame = int(info[phase])
+        current, previous, following = neighboring_indices(frame, shape[3])
+        img_path = pdir / f"{pdir.name}_frame{frame:02d}.nii"
+        if not img_path.is_file():
+            img_path = img_path.with_suffix(".nii.gz")
+        gt_path = pdir / f"{pdir.name}_frame{frame:02d}_gt.nii"
+        if not gt_path.is_file():
+            gt_path = gt_path.with_suffix(".nii.gz")
+        if not img_path.is_file() or not gt_path.is_file():
+            raise FileNotFoundError(f"Missing normalized {phase} image/GT in {pdir}")
+        img = nib.load(str(img_path)); gt = nib.load(str(gt_path))
+        if img.shape != shape[:3] or gt.shape != shape[:3]:
+            raise ValueError(f"{phase}: phase/GT shape differs from 4D cine")
+        if not np.allclose(cine_nii.affine, img.affine, rtol=0, atol=1e-3):
+            raise ValueError(f"{phase}: affine differs from 4D cine")
+        if not np.allclose(img.affine, gt.affine, rtol=0, atol=1e-3):
+            raise ValueError(f"{phase}: label geometry differs from image")
+        phase_arr = np.asarray(img.dataobj, dtype=np.float32)
+        scores = {}
+        for idx in (previous, current, following):
+            scores[idx] = _phase_similarity(
+                phase_arr, np.asarray(cine_nii.dataobj[..., idx], dtype=np.float32)
+            )
+        target_score = scores[current]
+        max_neighbor = max(scores[previous], scores[following])
+        if target_score < min_ncc:
+            raise ValueError(f"{phase}: frame index {frame} has NCC={target_score:.5f} < {min_ncc}")
+        if max_neighbor > target_score + 0.0001:
+            raise ValueError(f"{phase}: declared frame {frame} NCC={target_score:.5f}, "
+                             f"adjacent frame matches BETTER ({max_neighbor:.5f}): possible time off-by-one")
+        if target_score - max_neighbor < 1e-6:
+            raise ValueError(f"{phase}: ambiguous 4D phase mapping; adjacent frame "
+                             "is indistinguishable from declared ED/ES. Manual review required")
+        diagnostics[phase] = {"frame_1based": frame,
+                              "indexed_frame_ncc": target_score,
+                              "best_adjacent_ncc": max_neighbor}
+    if int(info["ED"]) == int(info["ES"]):
+        raise ValueError("ED and ES are the same frame")
+    return {"path": str(path), "shape": list(shape), "phase_checks": diagnostics}
+
+
 def inspect_cine(normalized_root: Path) -> dict:
     original = raw_root(normalized_root)
     results = []
-    nib = _nib()
     for folder in sorted((original / "training").glob("patient*")):
         if not folder.is_dir():
             continue
         rec = {"patient": folder.name}
         try:
-            path = find_cine(folder)
-            nii = nib.load(str(path))
-            if len(nii.shape) != 4 or min(nii.shape[:3]) < 2 or nii.shape[3] < 3:
-                raise ValueError(f"Expected (H,W,Z,T>=3) 4D cine, got {nii.shape}")
-            rec.update({"found": True, "path": str(path),
-                        "shape": list(nii.shape)})
-        except (FileNotFoundError, ValueError, OSError) as ex:
-            rec.update({"found": False, "reason": str(ex)})
+            checks = verify_patient_cine(folder, normalized_root)
+            rec.update({"found": True, "validated": True, **checks})
+        except (FileNotFoundError, ValueError, OSError, KeyError) as ex:
+            rec.update({"found": False, "validated": False, "reason": str(ex)})
         results.append(rec)
-    summary = {
-        "original_root": str(original),
-        "total_patients": len(results),
-        "cine_available": sum(v["found"] for v in results),
-        "cine_missing": sum(not v["found"] for v in results),
-        "patients": results,
-    }
-    return summary
+    good = sum(v["validated"] for v in results)
+    return {"protocol": "strict-cine-ed-es-v2", "original_root": str(original),
+            "total_patients": len(results), "cine_available": good,
+            "cine_missing": len(results) - good,
+            "ready": len(results) == 100 and good == 100,
+            "patients": results}
 
 
 @lru_cache(maxsize=8)
@@ -113,9 +190,21 @@ def _zscore(img: np.ndarray) -> np.ndarray:
     return ((img - float(img.mean())) / (float(img.std()) + 1e-6)).astype(np.float32)
 
 
+def phase_context(frame: int, num_frames: int, ed_frame: int) -> np.ndarray:
+    """ED-anchored target phase sin/cos and 1/T for directional coding.
+
+    The start of a NIfTI cine series need not mean the same physiological
+    state for all patients; use the verified ED frame as cycle origin.
+    """
+    t, _, _ = neighboring_indices(frame, num_frames)
+    reference, _, _ = neighboring_indices(ed_frame, num_frames)
+    angle = 2 * np.pi * ((t - reference) % num_frames) / num_frames
+    return np.array([np.sin(angle), np.cos(angle), 1. / num_frames], dtype=np.float32)
+
+
 def build_temporal_input(volume: np.ndarray, cine: np.ndarray,
-                         z: int, frame: int, size: int = 256):
-    """Return spatial [3,H,W] and true cardiac neighbors [2,H,W]."""
+                         z: int, frame: int, ed_frame: int, size: int = 256):
+    """Return spatial [3,H,W], real time neighbors [2,H,W], phase [3]."""
     if volume.ndim != 3 or cine.shape[:3] != volume.shape:
         raise ValueError("Volume and cine shapes must agree")
     s = volume.shape[2]
@@ -129,7 +218,7 @@ def build_temporal_input(volume: np.ndarray, cine: np.ndarray,
                        interpolation=cv2.INTER_LINEAR)
     plus = cv2.resize(_zscore(cine[..., z, tp]), (size, size),
                       interpolation=cv2.INTER_LINEAR)
-    return np.stack(spatial, axis=0), np.stack((minus, plus), axis=0)
+    return np.stack(spatial, axis=0), np.stack((minus, plus), axis=0), phase_context(frame, cine.shape[3], ed_frame)
 
 
 class ACDCCineDataset:
@@ -162,7 +251,8 @@ class ACDCCineDataset:
             cfg = pulse_source.parse_info_cfg(patient / "Info.cfg")
             frame = int(cfg[r["phase"]])
             neighboring_indices(frame, nii.shape[3])
-            self.rec_paths[(r["pid"], r["phase"])] = (str(path), frame)
+            self.rec_paths[(r["pid"], r["phase"])] = (
+                str(path), frame, int(cfg["ED"]))
         self.aug = None
         if train:
             source_aug = pulse_source._build_aug()
@@ -178,12 +268,12 @@ class ACDCCineDataset:
 
     def __getitem__(self, index):
         rec, z, s = self.base.slices[index]
-        path, frame = self.rec_paths[(rec["pid"], rec["phase"])]
+        path, frame, ed_frame = self.rec_paths[(rec["pid"], rec["phase"])]
         cine, affine = _load_cine(path)
         nib = _nib()
         image = np.asarray(nib.load(rec["img"]).dataobj, dtype=np.float32)
         label = np.asarray(nib.load(rec["gt"]).dataobj[..., z], dtype=np.uint8)
-        spatial, temporal = build_temporal_input(image, cine, z, frame, self.size)
+        spatial, temporal, phase = build_temporal_input(image, cine, z, frame, ed_frame, self.size)
         gt = cv2.resize(label, (self.size,self.size),interpolation=cv2.INTER_NEAREST)
         x = np.ascontiguousarray(spatial.transpose(1,2,0))
         minus, plus = temporal
@@ -196,6 +286,7 @@ class ACDCCineDataset:
             "img": self.torch.from_numpy(np.ascontiguousarray(x.transpose(2,0,1))).float(),
             "temporal": self.torch.from_numpy(
                 np.ascontiguousarray(np.stack((minus,plus),axis=0))).float(),
+            "phase_context": self.torch.from_numpy(phase.copy()).float(),
             "mask": self.torch.from_numpy(np.ascontiguousarray(gt)).long(),
         }
 
@@ -213,11 +304,11 @@ def main():
         args.output.write_text(json.dumps(info,indent=2,ensure_ascii=False),encoding="utf-8")
     print(f"ACDC 4D cine: {info['cine_available']}/{info['total_patients']} patients")
     for r in info["patients"]:
-        if not r["found"]:
-            print(f"  Missing {r['patient']}: {r['reason']}")
+        if not r["validated"]:
+            print(f"  Failed {r['patient']}: {r['reason']}")
     if args.require_all and (info["cine_missing"] or info["total_patients"] != 100):
-        raise SystemExit("Missing complete 4D cine data; V2 training REFUSED. "
-                         "Do not fabricate neighboring time frames.")
+        raise SystemExit("4D cine/ED-ES correspondence preflight failed; V2 training REFUSED. "
+                         "Do not fabricate or misindex neighboring time frames.")
 
 
 if __name__ == "__main__":

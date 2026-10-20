@@ -37,7 +37,7 @@ class TinyTemporalEncoder(nn.Module):
         return self.net(image)
 
 
-def warp_2d(source: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+def warp_2d(source: torch.Tensor, offsets: torch.Tensor, return_valid: bool=False):
     """Pull-back resampling in feature-pixel coordinates (x,y), align_corners=True."""
     if source.ndim != 4 or offsets.shape != (source.shape[0],2,*source.shape[-2:]):
         raise ValueError("warp expects BCHW features and B2HW offsets")
@@ -49,7 +49,10 @@ def warp_2d(source: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     grid = torch.stack((x,y),dim=-1).unsqueeze(0).expand(b,-1,-1,-1)
     scale = torch.tensor([2/max(1,w-1), 2/max(1,h-1)],device=source.device,dtype=dtype)
     shifted = grid + offsets.permute(0,2,3,1) * scale
-    return F.grid_sample(source,shifted,mode="bilinear",padding_mode="border",align_corners=True)
+    valid = ((shifted[..., 0] >= -1) & (shifted[..., 0] <= 1) &
+             (shifted[..., 1] >= -1) & (shifted[..., 1] <= 1)).unsqueeze(1)
+    sampled = F.grid_sample(source,shifted,mode="bilinear",padding_mode="zeros",align_corners=True)
+    return (sampled,valid) if return_valid else sampled
 
 
 class BidirectionalEvidenceFusion(nn.Module):
@@ -69,6 +72,13 @@ class BidirectionalEvidenceFusion(nn.Module):
             nn.Conv2d(temporal_channels * 2 + 2, temporal_channels, 3,padding=1),
             nn.GELU(),nn.Conv2d(temporal_channels,1,1),
         )
+        # Direction is explicit: at identical input images, past and future
+        # carry distinct signed phase offsets and learnable embeddings.
+        self.direction_embed = nn.Parameter(torch.randn(2, temporal_channels) * .02)
+        self.time_condition = nn.Sequential(
+            nn.Linear(4, temporal_channels), nn.Tanh(),
+            nn.Linear(temporal_channels, temporal_channels)
+        )
         self.to_decoder = nn.Conv2d(temporal_channels, decoder_channels, 1)
         nn.init.zeros_(self.to_decoder.weight)
         nn.init.zeros_(self.to_decoder.bias)
@@ -77,11 +87,16 @@ class BidirectionalEvidenceFusion(nn.Module):
         self.probe = nn.Conv2d(temporal_channels * 2, 4, 1)
 
     def forward(self, spatial_middle: torch.Tensor,
-                temporal: torch.Tensor, feature_shape: tuple[int,int]):
+                temporal: torch.Tensor, feature_shape: tuple[int,int],
+                phase: torch.Tensor):
         if spatial_middle.ndim!=4 or spatial_middle.shape[1]!=1:
             raise ValueError("Expected spatial-middle intensity B1HW")
         if temporal.shape != (spatial_middle.shape[0],2,*spatial_middle.shape[-2:]):
             raise ValueError("Expected true temporal neighbors B2HW")
+        if phase.shape != (spatial_middle.shape[0], 3):
+            raise ValueError("Expected phase_context B3 [sin,cos,1/T]")
+        if not torch.isfinite(phase).all() or not ((phase[:,2] > 0) & (phase[:,2] <= 1/3)).all():
+            raise ValueError("Invalid nonfinite or impossible temporal phase context")
         h,w = feature_shape
         image0 = self.encoder(spatial_middle)
         imgm = self.encoder(temporal[:,0:1])
@@ -91,15 +106,21 @@ class BidirectionalEvidenceFusion(nn.Module):
         current, before, after = features
         aligned=[]
         quality=[]
-        for neighboring in (before,after):
-            offsets = self.max_offset * torch.tanh(self.align(torch.cat((current,neighboring),1)))
-            moved = warp_2d(neighboring,offsets)
+        validities=[]
+        for direction, neighboring in enumerate((before,after)):
+            signed_step = (2*direction-1) * phase[:,2:3]
+            time_code = torch.cat((phase, signed_step),dim=1).to(neighboring.dtype)
+            embedding = (self.time_condition(time_code) + self.direction_embed[direction])[:, :, None, None]
+            conditioned = neighboring + embedding
+            offsets = self.max_offset * torch.tanh(self.align(torch.cat((current,conditioned),1)))
+            moved, valid = warp_2d(neighboring,offsets,return_valid=True)
             delta = (current-moved).abs().mean(dim=1,keepdim=True)
             magnitude = offsets.square().sum(dim=1,keepdim=True).sqrt() / self.max_offset
-            score = self.quality(torch.cat((current,moved,delta,magnitude),dim=1))
+            score = self.quality(torch.cat((current,moved+embedding,delta,magnitude),dim=1))
             # Independent agreement and motion penalties discourage blindly
             # trusting poorly matched temporal evidence.
-            score = score - delta - 0.25*magnitude
+            score = (score - delta - 0.25*magnitude).masked_fill(~valid, -1e4)
+            validities.append(valid)
             aligned.append(moved)
             quality.append(score)
         logits = torch.cat((torch.zeros_like(quality[0]),quality[0],quality[1]),1)
@@ -111,7 +132,8 @@ class BidirectionalEvidenceFusion(nn.Module):
         update = self.to_decoder(residual)
         probe_minus = self.probe(torch.cat((current,aligned[0]),1))
         probe_plus = self.probe(torch.cat((current,aligned[1]),1))
-        return update, {"weights": weights, "probe_minus": probe_minus,
+        return update, {"weights": weights, "valid_minus":validities[0],
+                        "valid_plus":validities[1], "probe_minus": probe_minus,
                         "probe_plus": probe_plus}
 
 
@@ -134,6 +156,8 @@ def reliable_agreement_loss(aux: dict, target_logits: torch.Tensor,
     conf = torch.softmax(F.interpolate(target_logits.detach().float(),size=a.shape[-2:],
                        mode="bilinear",align_corners=False),dim=1).max(1,keepdim=True)[0]
     trust = aux["weights"][:,1:2].detach().minimum(aux["weights"][:,2:3].detach())
+    if "valid_minus" in aux and "valid_plus" in aux:
+        trust = trust * aux["valid_minus"].detach() * aux["valid_plus"].detach()
     mask = (conf >= threshold).float()
     weighted = trust * mask
     # No selected pixels => exactly zero with valid gradients.
@@ -141,14 +165,21 @@ def reliable_agreement_loss(aux: dict, target_logits: torch.Tensor,
 
 
 class CineDPTDecoder(nn.Module):
-    def __init__(self, core: nn.Module, structure: bool = True):
+    def __init__(self, core: nn.Module, structure: bool = True, temporal: bool=True):
         super().__init__()
         self.spatial = SelectiveDPTDecoder(core)
         projection = next(m for m in core.projs[0].modules() if isinstance(m,nn.Linear))
         self.temporal = BidirectionalEvidenceFusion(projection.out_features)
         self.enable_structure = structure
+        self.enable_temporal = temporal
+        if not structure:
+            for param in self.spatial.enhancers.parameters():
+                param.requires_grad_(False)
+        if not temporal:
+            for param in self.temporal.parameters():
+                param.requires_grad_(False)
 
-    def forward(self, hs, spatial_middle, neighbors):
+    def forward(self, hs, spatial_middle, neighbors, phase):
         dec = self.spatial
         core = dec.core
         f = [core._reassemble(h,core.projs[i]) for i,h in enumerate(hs)]
@@ -157,7 +188,10 @@ class CineDPTDecoder(nn.Module):
             f[2],size=x.shape[-2:],mode="bilinear",align_corners=False)))
         a1 = core.aux1(x)
         skip1=F.interpolate(f[1],size=x.shape[-2:],mode="bilinear",align_corners=False)
-        delta, aux = self.temporal(spatial_middle,neighbors,x.shape[-2:])
+        if self.enable_temporal:
+            delta, aux = self.temporal(spatial_middle,neighbors,x.shape[-2:],phase)
+        else:
+            delta, aux = torch.zeros_like(x), None
         pre = x
         x = pre + skip1 + delta
         if self.enable_structure:
@@ -178,12 +212,13 @@ class CineDPTDecoder(nn.Module):
 class PULSECineReliabilityV2(nn.Module):
     EXTRACT = (3,6,9,12)
 
-    def __init__(self, original_pulse: nn.Module, use_structure: bool = True):
+    def __init__(self, original_pulse: nn.Module, use_structure: bool = True,
+                 use_temporal: bool=True):
         super().__init__()
         if not hasattr(original_pulse.decoder,"projs"):
             raise TypeError("Expected an untouched PULSESeg model")
         self.base=original_pulse
-        self.decoder=CineDPTDecoder(original_pulse.decoder,structure=use_structure)
+        self.decoder=CineDPTDecoder(original_pulse.decoder,structure=use_structure,temporal=use_temporal)
         # Avoid separately registering the original decoder twice.
         self.base.decoder=nn.Identity()
 
@@ -192,15 +227,17 @@ class PULSECineReliabilityV2(nn.Module):
         return self.base.backbone_blocks
 
     def forward(self, spatial: torch.Tensor, temporal: torch.Tensor,
-                return_aux: bool=False):
+                phase_context: torch.Tensor, return_aux: bool=False):
         if spatial.ndim!=4 or spatial.shape[1]!=3:
             raise ValueError("Expected PULSE spatial input B3HW")
         if temporal.shape != (spatial.shape[0],2,*spatial.shape[-2:]):
             raise ValueError("Expected cardiac-time neighbors B2HW")
+        if phase_context.shape != (spatial.shape[0],3):
+            raise ValueError("Expected phase_context B3")
         x=self.base.stem(spatial)
         out=self.base.vit(pixel_values=x,output_hidden_states=True)
         hs=[out.hidden_states[i] for i in self.EXTRACT]
-        outputs,aux=self.decoder(hs,spatial[:,1:2],temporal)
+        outputs,aux=self.decoder(hs,spatial[:,1:2],temporal,phase_context)
         return (*outputs,aux) if return_aux else outputs
 
 
@@ -210,7 +247,10 @@ def load_cine_v2(pulse_root, checkpoint, device):
     raw=torch.load(str(checkpoint),map_location="cpu",weights_only=True)
     if raw.get("variant")!="cine-reliability-v2":
         raise ValueError("Expected cine-reliability-v2 checkpoint")
+    if raw.get("protocol_version") != "audited-directional-v2":
+        raise ValueError("Incompatible V2 checkpoint: expected audited-directional-v2 protocol")
     model=PULSECineReliabilityV2(source.PULSESeg(256),
-            use_structure=bool(raw.get("use_structure",True)))
+            use_structure=bool(raw.get("use_structure",True)),
+            use_temporal=bool(raw.get("use_temporal",True)))
     model.load_state_dict(raw["model"],strict=True)
     return model.to(device).eval()
