@@ -1,6 +1,9 @@
-"""Launch unmodified upstream 120-epoch PULSE single-fold training.
+"""Launch PULSE upstream training with an end-of-run empty-test guard.
 
-'epochs=1' is a smoke test only; the original unfreezing schedule has 70+50 epochs.
+The Kaggle original ACDC test labels are unavailable. A guarded temporary copy
+of the upstream entrypoint skips only its final test-set report when zero labeled
+records exist. Training, model, validation and checkpoint code remain unchanged.
+One epoch is a smoke test, not reproduction of the 120-epoch curriculum.
 """
 from __future__ import annotations
 
@@ -11,6 +14,28 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+# Exact upstream main() end-of-run block, at PULSE commit 781e0712.
+_TEST_END = r'''    t = eval_epoch(model, te_dl, device, tta=True)
+    print(f"\n[FOLD {args.fold} TEST+TTA] RV={t[0]:.3f} Myo={t[1]:.3f} LV={t[2]:.3f} mean={t.mean():.3f}")''' 
+
+
+def make_training_entry(upstream_script: Path, destination: Path) -> Path:
+    """Copy pinned upstream entrypoint, guard ONLY its final empty test split."""
+    source = upstream_script.read_text(encoding="utf-8")
+    if source.count(_TEST_END) != 1:
+        raise RuntimeError(
+            "PULSE upstream source changed: test-evaluation guard anchor not unique. "
+            "Review the upstream version before training."
+        )
+    replacement = r'''    if len(test_recs) > 0:
+        t = eval_epoch(model, te_dl, device, tta=True)
+        print(f"\n[FOLD {args.fold} TEST+TTA] RV={t[0]:.3f} Myo={t[1]:.3f} LV={t[2]:.3f} mean={t.mean():.3f}")
+    else:
+        print("[TEST] No publicly labeled testing records: final test evaluation skipped.")''' 
+    destination.write_text(source.replace(_TEST_END, replacement), encoding="utf-8")
+    return destination
 
 
 def run(acdc_root: Path, pulse_root: Path, fold: int, epochs: int,
@@ -27,18 +52,20 @@ def run(acdc_root: Path, pulse_root: Path, fold: int, epochs: int,
         raise FileExistsError(
             f"Would overwrite an existing run: {weights_target}; choose a new --out-dir"
         )
-    cmd = [sys.executable, "pulse/train.py", "--fold", str(fold),
+    entry = out_dir / "pulse_seg_training_entry.py"
+    cmd = [sys.executable, str(entry), "--fold", str(fold),
            "--nfolds", "5", "--epochs", str(epochs),
            "--bs", str(batch_size), "--ckpt_dir", str(out_dir),
            "--data_root", str(acdc_root)]
     meta = {"command": cmd, "fold": fold, "epochs": epochs,
             "batch_size": batch_size, "acdc_root": str(acdc_root),
             "upstream": str(pulse_root),
-            "note": "Official 120-epoch 2-stage training only when --epochs 120"}
+            "note": "Upstream train/val logic unchanged; temp entrypoint guards empty labeled testing split."}
     print("Executing:", " ".join(cmd), flush=True)
     if dry_run:
         print(json.dumps(meta, indent=2))
         return
+    make_training_entry(pulse_root / "pulse" / "pulse_seg.py", entry)
     (out_dir / "run_config.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     env = os.environ.copy()
     env["ACDC_ROOT"] = str(acdc_root)

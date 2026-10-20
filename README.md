@@ -12,6 +12,7 @@ This project is for a controlled baseline before any research-model modification
 - One training-set patient `patient001` generated labels successfully; three-class mean Dice 0.9181 on this **training** patient (NOT an independent result).
 - One T4, one fold, four-flip TTA: 1.97 s stable inference for shape `(216, 256, 10)`; PyTorch allocated memory peak 0.58 GiB.
 - Official stratified `fold_0` (seed 42) comprises 80 training / 20 validation patients; `patient001` belongs to training and must not contribute to validation results.
+- **Independent fold_0 validation completed by user, single checkpoint, 4-flip TTA:** 20 patients / 40 ED–ES volumes; RV Dice **0.9072**, Myo Dice **0.8438**, LV Dice **0.9173**, patient-averaged mean Dice **0.8895**. RV/Myo/LV HD95 **1.09/1.15/1.20 mm**, mean inference time **2.28 s/volume**. These results came from the user's earlier Kaggle evaluation Cell 10, not from the new harness; the new harness must reproduce them within metric/method tolerance before experiments.
 
 ## Start in Kaggle (GPU enabled, Internet on for first setup)
 
@@ -19,7 +20,7 @@ In an existing Kaggle notebook, with ACDC Original Dataset attached as Input:
 
 Open `notebooks/kaggle_run.ipynb` and run the cells from top to bottom. The clone cell supports both public and private repositories. For a **private** repository, configure a Kaggle notebook Secret named `GITHUB_READ_TOKEN` holding a fine-grained, **read-only Contents** GitHub token restricted to this repo. The notebook passes it to Git only as a subprocess environment value; it never prints the token. No token is needed for a public repo.
 
-If your repo is public, the equivalent manual commands are:
+The current GitHub repository is **public**; no GitHub token is needed. The equivalent manual commands are:
 
 ```python
 %cd /kaggle/working
@@ -60,7 +61,7 @@ First do a **single-fold smoke train** to check the current GPU runtime. By defa
   --out-dir /kaggle/working/pulse_results/smoke_fold0
 ```
 
-For official method training, change to `--epochs 120` and independently reproduce each requested fold. `--epochs 1` is only a smoke test; it does not reproduce the original two-stage 120-epoch curriculum. The upstream model uses one GPU; the second Kaggle T4 remains idle unless explicit distributed training is implemented.
+The Kaggle challenge testing partition normally lacks public reference labels. The training wrapper writes an audit-visible copy of the upstream entrypoint in the run directory and adds a guard only around the **final test reporting** block, skipping evaluation when no labeled test cases exist. The original PULSE files and all training/validation/checkpoint logic remain unchanged. This avoids a false failure after the last epoch. For official method training, change to `--epochs 120` and independently reproduce each requested fold. `--epochs 1` is only a smoke test; it does not reproduce the original two-stage 120-epoch curriculum. The upstream model uses one GPU; the second Kaggle T4 remains idle unless explicit distributed training is implemented.
 
 ## Important protocol distinctions
 
@@ -81,7 +82,7 @@ pulse_repro/metrics.py           # full-volume Dice, HD95, ASSD, empty-case flag
 pulse_repro/runtime.py           # official TTA and a fast, explicitly separated no-TTA mode
 pulse_repro/evaluate.py          # strict fold 0 validation, patient-level statistics, CSV/JSON
 pulse_repro/benchmark.py         # warm/cold speed and CUDA memory audit
-pulse_repro/train_official.py    # safe wrapper around upstream training entrypoint
+pulse_repro/train_official.py    # upstream training with isolated empty-test reporting guard
 notebooks/kaggle_run.ipynb       # cells for all steps
 requirements-kaggle.txt         # lightweight evaluation dependencies
 ```
