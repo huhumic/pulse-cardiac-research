@@ -20,7 +20,8 @@ CLASSES = ((1, "RV"), (2, "Myo"), (3, "LV"))
 
 def evaluate(acdc_root: Path, pulse_root: Path, weights: Path, out_dir: Path,
              fold: int = 0, tta: bool = True, batch_size: int = 8,
-             max_patients: int | None = None, save_masks: bool = False) -> dict:
+             max_patients: int | None = None, save_masks: bool = False,
+             model_variant: str = "official") -> dict:
     if fold not in range(5):
         raise ValueError("fold must be 0..4")
     if not (acdc_root / "training").is_dir():
@@ -47,7 +48,15 @@ def evaluate(acdc_root: Path, pulse_root: Path, weights: Path, out_dir: Path,
     ck = torch.load(str(weights), map_location="cpu", weights_only=True)
     if "fold" not in ck or int(ck["fold"]) != fold:
         raise ValueError(f"Checkpoint fold metadata {ck.get('fold')} conflicts with --fold {fold}")
-    model = load_one(pulse_root, weights, device)
+    if model_variant == "official":
+        if ck.get("variant") == "selective-v1":
+            raise ValueError("selective-v1 weights require --model-variant selective-v1")
+        model = load_one(pulse_root, weights, device)
+    elif model_variant == "selective-v1":
+        from .selective_v1 import load_variant
+        model = load_variant(pulse_root, weights, device)
+    else:
+        raise ValueError(f"Unknown model variant: {model_variant}")
 
     results = []
     for k, r in enumerate(sample_recs, 1):
@@ -94,7 +103,7 @@ def evaluate(acdc_root: Path, pulse_root: Path, weights: Path, out_dir: Path,
         "protocol": "single-fold out-of-fold full-volume ED/ES: 20 patients/40 vols",
         "warning": ("Full-volume metrics differ from upstream sampled-slice validation, "
                     "and are NOT the paper's 5-fold ensemble metrics."),
-        "fold": fold, "seed": 42,
+        "fold": fold, "seed": 42, "model_variant": model_variant,
         "n_valid_patients": len(selected), "n_volumes": len(df),
         "full_fold": max_patients is None or len(selected) == 20,
         "tta": bool(tta), "weights": str(weights), "weights_sha256": file_sha256(weights),
@@ -133,6 +142,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=8, help="For the explicitly non-TTA mode only")
     p.add_argument("--max-patients", type=int, default=None, help="Smoke test; not a full-fold result")
     p.add_argument("--save-masks", action="store_true")
+    p.add_argument("--model-variant", choices=("official", "selective-v1"), default="official")
     args = p.parse_args()
     evaluate(**vars(args))
 
