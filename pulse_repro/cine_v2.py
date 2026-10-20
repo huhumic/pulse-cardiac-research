@@ -137,6 +137,16 @@ class BidirectionalEvidenceFusion(nn.Module):
                         "probe_plus": probe_plus}
 
 
+def masked_probe_ce(probe_logits: torch.Tensor, target: torch.Tensor,
+                    valid: torch.Tensor) -> torch.Tensor:
+    """Supervise target-frame probe only where neighbor warp is in-bounds."""
+    if valid.shape != (target.shape[0],1,*target.shape[-2:]):
+        raise ValueError("Probe validity mask shape does not match target")
+    pixels = F.cross_entropy(probe_logits.float(), target, reduction="none")
+    mask = valid[:, 0].to(pixels.dtype)
+    return (mask * pixels).sum() / mask.sum().clamp_min(1.)
+
+
 def reliable_agreement_loss(aux: dict, target_logits: torch.Tensor,
                             threshold: float = 0.55) -> torch.Tensor:
     """Confidence/quality-weighted Jensen-Shannon of two target-aligned probes.

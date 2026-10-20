@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .cine_data import ACDCCineDataset, inspect_cine, raw_root
-from .cine_v2 import PULSECineReliabilityV2, reliable_agreement_loss
+from .cine_v2 import PULSECineReliabilityV2, reliable_agreement_loss, masked_probe_ce
 
 
 def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
@@ -143,8 +143,8 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
                         low_gt=F.interpolate(labels[:,None].float(),size=aux["probe_minus"].shape[-2:],
                                              mode="nearest")[:,0].long()
                         loss=loss + probe_weight*0.5*(
-                            F.cross_entropy(aux["probe_minus"],low_gt) +
-                            F.cross_entropy(aux["probe_plus"],low_gt))
+                            masked_probe_ce(aux["probe_minus"],low_gt,aux["valid_minus"]) +
+                            masked_probe_ce(aux["probe_plus"],low_gt,aux["valid_plus"]))
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(),1.0)

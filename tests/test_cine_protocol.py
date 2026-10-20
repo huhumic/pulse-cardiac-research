@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from pulse_repro import cine_data
-from pulse_repro.cine_v2 import PULSECineReliabilityV2, load_cine_v2
+from pulse_repro.cine_v2 import PULSECineReliabilityV2, load_cine_v2, masked_probe_ce
 from pulse_repro.train_cine_v2 import run
 from test_cine_v2 import MiniPulse
 
@@ -98,3 +98,22 @@ def test_ablation_disables_unused_module_gradients():
     assert all(not p.requires_grad for p in model.decoder.spatial.enhancers.parameters())
     assert all(not p.requires_grad for p in model.decoder.temporal.parameters())
     assert any(p.requires_grad for p in model.base.stem.parameters())
+
+
+def test_probe_cross_entropy_is_masked_on_invalid_warp():
+    from torch.nn import functional as F
+    logits=torch.randn(1,4,8,8,requires_grad=True)
+    labels=torch.randint(0,4,(1,8,8))
+    valid=torch.ones((1,1,8,8),dtype=torch.bool)
+    torch.testing.assert_close(masked_probe_ce(logits,labels,valid),
+                               F.cross_entropy(logits,labels),atol=1e-7,rtol=1e-7)
+    valid[:,:,:,4:]=False
+    first=masked_probe_ce(logits,labels,valid)
+    altered=logits.clone()
+    altered[:,:,:,4:]+=1000
+    second=masked_probe_ce(altered,labels,valid)
+    torch.testing.assert_close(first,second,atol=1e-6,rtol=1e-6)
+    none=masked_probe_ce(logits,labels,torch.zeros_like(valid))
+    assert none.item() == 0
+    none.backward()
+    assert torch.isfinite(logits.grad).all()

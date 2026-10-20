@@ -13,7 +13,12 @@
 | `--no-consistency` turned off two losses | Independent `--no-consistency`, `--no-probe-supervision`, `--no-temporal`, `--no-structure` switches | Training code guard enforces temporal-free ablation; same PULSE supervised loss retained |
 | No test for temporal use | `--temporal-control swap` and `repeat-target`, mean skip/past/future weights and valid fractions in evaluation report | Fixed-checkpoint controls only; need trained-model data |
 | Evaluation provenance | Explicit `full_fold`, 20 patient internal validation warning, fold and checkpoint SHA256 | Five folds or untouched test dataset still needed for journal-grade conclusions |
-| No true end-to-end run | 27 CPU tests across V1 and V2 contracts passed in isolated environment | Kaggle preflight, 3-step GPU forward/backward + single-case evaluation still required |
+| No true end-to-end run | 28 CPU tests across V1 and V2 contracts passed in isolated environment | Kaggle preflight, 3-step GPU forward/backward + single-case evaluation still required |
+
+Additional R2.1 correction: **probe cross-entropy now masks invalidly warped pixels**;
+previously the reliability gate and agreement term honored the sampling mask,
+but probe CE still penalized out-of-bounds evidence. The masked loss returns
+zero safely if no valid pixels exist. Verified with a dedicated regression test.
 
 ## Remaining boundaries (not claims of completeness)
 
@@ -27,7 +32,7 @@
 ## R2 code acceptance state
 
 - Static compilation: passed.
-- Tests: 27 passed, targeting standalone V2/legacy V1 and exact PULSE patch contracts.
+- Tests: 28 passed, targeting standalone V2/legacy V1 and exact PULSE patch contracts.
 - Data: strict patient-level preflight implemented but not exercised on the user's mounted Kaggle dataset.
 - Training: architecture source assembled but **not yet approved for full 120 epochs** until preflight and real GPU smoke run pass.
 - Main/V1: no files touched by this branch.
