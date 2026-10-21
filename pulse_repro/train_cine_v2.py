@@ -108,6 +108,40 @@ def _check_resume(ck: dict, expected: dict, best_path: Path) -> int:
     return epoch
 
 
+def _resolve_precision(requested: str, device: torch.device) -> str:
+    """No FP16 GradScaler: V2's audited run skipped every optimizer step."""
+    if requested not in ("auto", "bf16", "fp32"):
+        raise ValueError("Precision must be one of auto, bf16, fp32")
+    if requested == "fp32":
+        return "fp32"
+    supported = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    if requested == "bf16" and not supported:
+        raise RuntimeError("BF16 requested but CUDA hardware does not support it")
+    return "bf16" if supported else "fp32"
+
+
+def _clip_checked_gradients(model: nn.Module, max_norm: float = 1.0) -> float:
+    """Abort instead of silently retaining random weights."""
+    try:
+        norm = nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm, error_if_nonfinite=True
+        )
+    except RuntimeError as exc:
+        bad_names = []
+        for name, param in model.named_parameters():
+            if param.grad is not None and not bool(torch.isfinite(param.grad).all()):
+                bad_names.append(name)
+                if len(bad_names) >= 12:
+                    break
+        raise FloatingPointError(
+            f"V2 nonfinite gradients, first offending tensors: {bad_names}"
+        ) from exc
+    norm_value = float(norm.item())
+    if not np.isfinite(norm_value) or norm_value <= 0:
+        raise FloatingPointError(f"V2 gradient norm invalid or zero: {norm_value}")
+    return norm_value
+
+
 def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
         fold: int=0, epochs: int=120, batch_size: int=4,
         lr: float=3e-4, seed: int=42, use_structure: bool=True,
@@ -116,7 +150,7 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
         consistency_weight: float=0.05,
         probe_weight: float=0.1, num_workers: int=2,
         max_steps: int | None=None, save_every: int=2,
-        resume: bool=False):
+        resume: bool=False, precision: str="auto"):
     if fold not in range(5) or epochs<1 or batch_size<1 or lr<=0:
         raise ValueError("Invalid fold, epoch, batch size or learning rate")
     if num_workers<0 or consistency_weight<0 or probe_weight<0 or save_every<1:
@@ -179,7 +213,12 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
     optimizer=torch.optim.AdamW([
         {"params":bb_params,"lr":lr*.1},
         {"params":others,"lr":lr}],weight_decay=pulse.WD)
-    scaler=torch.amp.GradScaler(device.type,enabled=device.type=="cuda")
+    effective_precision = _resolve_precision(precision, device)
+    use_bf16 = effective_precision == "bf16"
+    # BF16 has FP32 exponent range and does not need dynamic loss scaling.
+    scaler=torch.amp.GradScaler(device.type,enabled=False)
+    print(f"[PRECISION] requested={precision} effective={effective_precision}; "
+          "GradScaler disabled; nonfinite gradients are fatal", flush=True)
     dice=pulse.WeightedDice(pulse.DICE_CLASS_W.to(device)).to(device)
     cross_entropy=nn.CrossEntropyLoss(weight=pulse.CE_CLASS_W.to(device))
     meta={"variant":"cine-reliability-v2","fold":fold,"epochs":epochs,
@@ -196,6 +235,9 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
           "consistency_scope":"target-aligned ED/ES probe agreement; NOT unlabeled target-frame learning",
           "temporal_preflight":"strict-cine-ed-es-v2",
           "num_workers":num_workers, "save_every":save_every,
+          "requested_precision":precision,
+          "effective_precision":effective_precision,
+          "gradient_guard":"nonfinite-loss-or-gradnorm-fail-fast-v1",
           "checkpoint_kind":CHECKPOINT_KIND,
           "acdc_root":str(acdc_root.resolve()),
           "pulse_root":str(pulse_root.resolve()),
@@ -249,7 +291,7 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
                 labels=b["mask"].to(device,non_blocking=True)
                 phase=b["phase_context"].to(device,non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast(device.type,enabled=device.type=="cuda"):
+                with torch.amp.autocast(device.type,dtype=torch.bfloat16,enabled=use_bf16):
                     main,a1,a2,aux=model(images,times,phase,return_aux=True)
                     y1=F.interpolate(labels[:,None].float(),size=a1.shape[-2:],
                                      mode="nearest")[:,0].long()
@@ -267,10 +309,24 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
                         loss=loss + probe_weight*0.5*(
                             masked_probe_ce(aux["probe_minus"],low_gt,aux["valid_minus"]) +
                             masked_probe_ce(aux["probe_plus"],low_gt,aux["valid_plus"]))
+                if not bool(torch.isfinite(loss.detach())):
+                    raise FloatingPointError(
+                        f"V2 nonfinite loss at epoch={epoch}, step={i}"
+                    )
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(),1.0)
-                scaler.step(optimizer);scaler.update();running.append(float(loss.detach()))
+                grad_norm = _clip_checked_gradients(model)
+                scaler.step(optimizer)
+                scaler.update()
+                if not optimizer.state:
+                    raise RuntimeError(
+                        f"V2 optimizer performed no parameter updates at epoch={epoch}, step={i}"
+                    )
+                if i == 0:
+                    print(f"[UPDATE] epoch={epoch} grad_norm={grad_norm:.5g} "
+                          f"adam_state_entries={len(optimizer.state)} "
+                          f"precision={effective_precision}", flush=True)
+                running.append(float(loss.detach()))
             if not running:raise RuntimeError("Zero training steps")
             model.eval();dices=[]
             with torch.no_grad():
@@ -285,14 +341,14 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
                             xi=images.flip(-1) if flip_h else images
                             ti=times.flip(-1) if flip_h else times
                             if flip_v:xi=xi.flip(-2);ti=ti.flip(-2)
-                            with torch.amp.autocast(device.type,enabled=device.type=="cuda"):
+                            with torch.amp.autocast(device.type,dtype=torch.bfloat16,enabled=use_bf16):
                                 logits,*_=model(xi,ti,phase)
                             if flip_h:logits=logits.flip(-1)
                             if flip_v:logits=logits.flip(-2)
                             probes.append(logits.float().softmax(1))
                         prob=torch.stack(probes).mean(0)
                     else:
-                        with torch.amp.autocast(device.type,enabled=device.type=="cuda"):
+                        with torch.amp.autocast(device.type,dtype=torch.bfloat16,enabled=use_bf16):
                             logits,*_=model(images,times,phase)
                         prob=logits.float().softmax(1)
                     dices.append(pulse.dice_per_class(prob,gt))
@@ -356,6 +412,8 @@ def main():
     p.add_argument("--probe-weight",type=float,default=.1)
     p.add_argument("--num-workers",type=int,default=2)
     p.add_argument("--save-every",type=int,default=2)
+    p.add_argument("--precision",choices=("auto","bf16","fp32"),default="auto",
+                   help="Auto selects BF16 on supporting GPUs, otherwise FP32; no FP16")
     p.add_argument("--resume",action="store_true")
     p.add_argument("--max-steps",type=int,default=None,
                    help="SMOKE TEST ONLY, not a full training result")
