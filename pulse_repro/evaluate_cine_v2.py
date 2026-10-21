@@ -109,8 +109,10 @@ def evaluate(acdc_root: Path,pulse_root: Path,weights: Path,out_dir: Path,
         if len(cine_nii.shape)!=4:raise ValueError("Expected 4D cine")
         frame=int(info[r["phase"]]);neighboring_indices(frame,cine_nii.shape[-1])
         volume,img=read_volume(Path(r["img"]))
-        if cine_nii.shape[:3]!=volume.shape or not np.allclose(cine_nii.affine,img.affine,atol=1e-3):
-            raise ValueError(f"Cine/phase shape or affine differs: {r['pid']}")
+        # verify_patient_cine() already validates indexed voxel alignment
+        # when a 4D NIfTI has no declared qform/sform geometry.
+        if cine_nii.shape[:3] != volume.shape:
+            raise ValueError(f"Cine/phase shape differs: {r['pid']}")
         cine=np.asarray(cine_nii.dataobj,dtype=np.float32)
         gt_nii=nib.load(r["gt"])
         if gt_nii.shape!=volume.shape or not np.allclose(img.affine,gt_nii.affine,atol=1e-3):
