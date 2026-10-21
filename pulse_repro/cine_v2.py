@@ -115,7 +115,13 @@ class BidirectionalEvidenceFusion(nn.Module):
             offsets = self.max_offset * torch.tanh(self.align(torch.cat((current,conditioned),1)))
             moved, valid = warp_2d(neighboring,offsets,return_valid=True)
             delta = (current-moved).abs().mean(dim=1,keepdim=True)
-            magnitude = offsets.square().sum(dim=1,keepdim=True).sqrt() / self.max_offset
+            # align[-1] is zero-initialized: offsets == 0 on the first step.
+            # sqrt(dx^2+dy^2) has an infinite derivative at zero and yields
+            # NaN offset gradients (both FP32 and BF16). Vector norm chooses
+            # the zero subgradient at zero while preserving the forward value.
+            magnitude = torch.linalg.vector_norm(
+                offsets, ord=2, dim=1, keepdim=True
+            ) / self.max_offset
             score = self.quality(torch.cat((current,moved+embedding,delta,magnitude),dim=1))
             # Independent agreement and motion penalties discourage blindly
             # trusting poorly matched temporal evidence.
