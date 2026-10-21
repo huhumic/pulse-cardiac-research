@@ -111,8 +111,11 @@ def verify_patient_cine(original: Path, normalized_root: Path,
         img = nib.load(str(img_path)); gt = nib.load(str(gt_path))
         if img.shape != shape[:3] or gt.shape != shape[:3]:
             raise ValueError(f"{phase}: phase/GT shape differs from 4D cine")
-        if not np.allclose(cine_nii.affine, img.affine, rtol=0, atol=1e-3):
-            raise ValueError(f"{phase}: affine differs from 4D cine")
+        # When 4D qform/sform are unset, nibabel supplies a fallback affine.
+        # Accept voxel-index alignment only after exact indexed-frame evidence.
+        affine_ok = bool(np.allclose(
+            cine_nii.affine, img.affine, rtol=0, atol=1e-3
+        ))
         if not np.allclose(img.affine, gt.affine, rtol=0, atol=1e-3):
             raise ValueError(f"{phase}: label geometry differs from image")
         phase_arr = np.asarray(img.dataobj, dtype=np.float32)
@@ -131,7 +134,27 @@ def verify_patient_cine(original: Path, normalized_root: Path,
         if target_score - max_neighbor < 1e-6:
             raise ValueError(f"{phase}: ambiguous 4D phase mapping; adjacent frame "
                              "is indistinguishable from declared ED/ES. Manual review required")
+        alignment = "affine"
+        if not affine_ok:
+            if (int(cine_nii.header["qform_code"]) != 0 or
+                    int(cine_nii.header["sform_code"]) != 0):
+                raise ValueError(
+                    f"{phase}: affine mismatch with valid 4D geometry"
+                )
+            actual_frame = np.asarray(
+                cine_nii.dataobj[..., current], dtype=np.float32
+            )
+            if not np.allclose(
+                phase_arr, actual_frame, rtol=1e-5, atol=1e-5
+            ):
+                raise ValueError(
+                    f"{phase}: missing 4D qform/sform AND "
+                    "target-frame voxel arrays do not match"
+                )
+            alignment = "voxel_identity_missing_4d_geometry"
+
         diagnostics[phase] = {"frame_1based": frame,
+                              "alignment": alignment,
                               "indexed_frame_ncc": target_score,
                               "best_adjacent_ncc": max_neighbor}
     if int(info["ED"]) == int(info["ES"]):
@@ -246,8 +269,26 @@ class ACDCCineDataset:
                 raise ValueError(f"Cine is not valid 4D: {path}, shape={nii.shape}")
             if nii.shape[:3] != nib.load(r["img"]).shape:
                 raise ValueError(f"Shape mismatch: {path} vs {r['img']}")
-            if not np.allclose(nii.affine, nib.load(r["img"]).affine, atol=1e-3):
-                raise ValueError(f"Affine mismatch: {path} vs {r['img']}")
+            phase_img = nib.load(r["img"])
+            if not np.allclose(
+                nii.affine, phase_img.affine, rtol=0, atol=1e-3
+            ):
+                if (int(nii.header["qform_code"]) != 0 or
+                        int(nii.header["sform_code"]) != 0):
+                    raise ValueError(f"Valid 4D affine mismatch: {path}")
+                phase_cfg = pulse_source.parse_info_cfg(
+                    patient / "Info.cfg"
+                )
+                phase_frame = int(phase_cfg[r["phase"]])
+                neighboring_indices(phase_frame, nii.shape[3])
+                target_3d = np.asarray(phase_img.dataobj, dtype=np.float32)
+                target_4d = np.asarray(
+                    nii.dataobj[..., phase_frame - 1], dtype=np.float32
+                )
+                if not np.allclose(
+                    target_3d, target_4d, rtol=1e-5, atol=1e-5
+                ):
+                    raise ValueError(f"Unverified 3D/4D voxel mapping: {path}")
             cfg = pulse_source.parse_info_cfg(patient / "Info.cfg")
             frame = int(cfg[r["phase"]])
             neighboring_indices(frame, nii.shape[3])
