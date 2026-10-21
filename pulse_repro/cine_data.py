@@ -244,12 +244,51 @@ def build_temporal_input(volume: np.ndarray, cine: np.ndarray,
     return np.stack(spatial, axis=0), np.stack((minus, plus), axis=0), phase_context(frame, cine.shape[3], ed_frame)
 
 
+def augment_cine_sample(aug, x: np.ndarray, gt: np.ndarray,
+                        minus: np.ndarray, plus: np.ndarray):
+    """Apply one synchronized geometric+photometric transform to five slices.
+
+    Albumentations image targets must have matching channel counts for
+    channel-shaped noise maps (notably GaussNoise). PULSE supplies the
+    spatial stack as HWC3; two HW temporal targets cannot be image targets
+    directly. Replicate each temporal scalar image to HWC3, apply the same
+    Compose/replay to all images and label, then retain one temporal channel.
+
+    Geometry remains synchronized, including affine/elastic/distortion.
+    The original three-channel PULSE spatial stack and its augmentation
+    distribution are unchanged.
+    """
+    if x.ndim != 3 or x.shape[-1] != 3:
+        raise ValueError(f"Expected spatial HWC3, received {x.shape}")
+    if gt.shape != x.shape[:2] or minus.shape != x.shape[:2] or plus.shape != x.shape[:2]:
+        raise ValueError("Spatial, mask, and cardiac-time image sizes must match")
+    minus_rgb = np.ascontiguousarray(np.repeat(minus[..., None], 3, axis=-1))
+    plus_rgb = np.ascontiguousarray(np.repeat(plus[..., None], 3, axis=-1))
+    augmented = aug(
+        image=np.ascontiguousarray(x),
+        mask=np.ascontiguousarray(gt),
+        temporal_minus=minus_rgb,
+        temporal_plus=plus_rgb,
+    )
+    tminus = augmented["temporal_minus"]
+    tplus = augmented["temporal_plus"]
+    if (tminus.shape != augmented["image"].shape or
+            tplus.shape != augmented["image"].shape):
+        raise ValueError("Augmented temporal target channel shape mismatch")
+    return (
+        np.ascontiguousarray(augmented["image"]),
+        np.ascontiguousarray(augmented["mask"]),
+        np.ascontiguousarray(tminus[..., 1]),
+        np.ascontiguousarray(tplus[..., 1]),
+    )
+
+
 class ACDCCineDataset:
     """Wrap original PULSE slice selection with time-synchronised augmentations.
 
     `records` must include `pid,phase,img,gt`. Only ED/ES have ground truth.
-    Geometry and photometric augmentation is synchronised across the 5 input
-    channels through one Albumentations Compose call, including labels.
+    Geometric augmentation is synchronized across spatial, cardiac-time and
+    labels; channel-shaped photometric transforms receive matching HWC3 images.
     """
 
     def __init__(self, records, original_root: Path, pulse_source,
@@ -319,10 +358,9 @@ class ACDCCineDataset:
         x = np.ascontiguousarray(spatial.transpose(1,2,0))
         minus, plus = temporal
         if self.aug is not None:
-            aug = self.aug(image=x, mask=gt, temporal_minus=minus,
-                           temporal_plus=plus)
-            x, gt = aug["image"], aug["mask"]
-            minus, plus = aug["temporal_minus"], aug["temporal_plus"]
+            x, gt, minus, plus = augment_cine_sample(
+                self.aug, x, gt, minus, plus
+            )
         return {
             "img": self.torch.from_numpy(np.ascontiguousarray(x.transpose(2,0,1))).float(),
             "temporal": self.torch.from_numpy(
