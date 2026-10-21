@@ -8,6 +8,7 @@ slices. Consistency probes predict the *target frame* only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -25,6 +26,88 @@ from .cine_data import ACDCCineDataset, inspect_cine, raw_root
 from .cine_v2 import PULSECineReliabilityV2, reliable_agreement_loss, masked_probe_ce
 
 
+
+VARIANT = "cine-reliability-v2"
+CHECKPOINT_KIND = "full-epoch-state-cine-v2-r1"
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _atomic_torch_save(obj: dict, destination: Path) -> None:
+    tmp = destination.with_name(destination.name + ".part")
+    torch.save(obj, tmp)
+    os.replace(tmp, destination)
+
+
+def _atomic_json(obj, destination: Path) -> None:
+    tmp = destination.with_name(destination.name + ".part")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, destination)
+
+
+def _rng_state() -> dict:
+    ns = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": {"name": ns[0], "keys": ns[1].tolist(),
+                  "position": int(ns[2]), "has_gauss": int(ns[3]),
+                  "cached_gaussian": float(ns[4])},
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def _restore_rng(saved: dict) -> None:
+    random.setstate(saved["python"])
+    ns = saved["numpy"]
+    np.random.set_state((ns["name"], np.asarray(ns["keys"], dtype=np.uint32),
+                         int(ns["position"]), int(ns["has_gauss"]),
+                         float(ns["cached_gaussian"])))
+    torch.set_rng_state(saved["torch_cpu"].cpu())
+    if torch.cuda.is_available():
+        states = saved["torch_cuda"]
+        if len(states) != torch.cuda.device_count():
+            raise ValueError("Saved and current CUDA device count differ")
+        torch.cuda.set_rng_state_all(states)
+
+
+def _unfreeze_stage2(blocks, frozen_count, optimizer, pulse):
+    if len(optimizer.param_groups) != 2:
+        raise ValueError("Stage-2 optimizer requires exactly two initial groups")
+    early = []
+    for block in blocks[:frozen_count]:
+        for param in block.parameters():
+            param.requires_grad_(True)
+            early.append(param)
+    if not early:
+        raise ValueError("No early-backbone parameters to unfreeze")
+    optimizer.add_param_group({"params": early, "lr": pulse.STAGE2_LR * .05})
+
+
+def _check_resume(ck: dict, expected: dict, best_path: Path) -> int:
+    if ck.get("checkpoint_kind") != CHECKPOINT_KIND or ck.get("variant") != VARIANT:
+        raise ValueError("Not an audited V2 full-state checkpoint")
+    if ck.get("run_config") != expected:
+        raise ValueError("Resume config or source fingerprint differs")
+    epoch = ck.get("epoch")
+    if not isinstance(epoch, int) or not 1 <= epoch < expected["epochs"]:
+        raise ValueError("Checkpoint epoch invalid for requested training")
+    for k in ("model", "optimizer", "scaler", "rng", "history", "best_dice"):
+        if k not in ck:
+            raise ValueError(f"Missing full-state checkpoint key: {k}")
+    if not isinstance(ck["history"], list) or len(ck["history"]) != epoch:
+        raise ValueError("Checkpoint history does not match saved epoch")
+    if not best_path.is_file():
+        raise FileNotFoundError("Existing best_model.pth missing; refusing resume")
+    return epoch
+
+
 def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
         fold: int=0, epochs: int=120, batch_size: int=4,
         lr: float=3e-4, seed: int=42, use_structure: bool=True,
@@ -32,10 +115,11 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
         use_probe_supervision: bool=True,
         consistency_weight: float=0.05,
         probe_weight: float=0.1, num_workers: int=2,
-        max_steps: int | None=None):
+        max_steps: int | None=None, save_every: int=2,
+        resume: bool=False):
     if fold not in range(5) or epochs<1 or batch_size<1 or lr<=0:
         raise ValueError("Invalid fold, epoch, batch size or learning rate")
-    if num_workers<0 or consistency_weight<0 or probe_weight<0:
+    if num_workers<0 or consistency_weight<0 or probe_weight<0 or save_every<1:
         raise ValueError("Invalid worker/loss configuration")
     if not use_temporal and (use_consistency or use_probe_supervision):
         raise ValueError("Without temporal fusion, disable consistency AND probe supervision")
@@ -43,6 +127,8 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
         raise ValueError("max_steps must be positive")
     if max_steps is not None and epochs != 1:
         raise ValueError("--max-steps is a one-epoch smoke test only")
+    if resume and max_steps is not None:
+        raise ValueError("Cannot resume a partial-step smoke test")
     if not (acdc_root/"training").is_dir():
         raise FileNotFoundError("Normalized ACDC directory is missing")
     preflight=inspect_cine(acdc_root)
@@ -53,9 +139,15 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
             "ED/ES-only data are NOT sufficient. Run `python -m pulse_repro.cine_data`."
         )
     original=raw_root(acdc_root)
-    if out_dir.exists() and any(out_dir.iterdir()):
-        raise FileExistsError(f"Existing V2 run directory cannot be overwritten: {out_dir}")
-    out_dir.mkdir(parents=True,exist_ok=False if not out_dir.exists() else True)
+    cfg_path = out_dir / "run_config.json"
+    state_path = out_dir / "last_state.pth"
+    best_path = out_dir / "best_model.pth"
+    if resume:
+        if not cfg_path.is_file() or not state_path.is_file():
+            raise FileNotFoundError("--resume requires run_config.json and last_state.pth")
+    elif out_dir.exists() and any(out_dir.iterdir()):
+        raise FileExistsError(f"Nonempty V2 output dir: {out_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed(seed);np.random.seed(seed);torch.manual_seed(seed)
     if torch.cuda.is_available():torch.cuda.manual_seed_all(seed)
@@ -102,22 +194,52 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
           "selection_metric":"original PULSE average per-slice Dice (TTA after epoch 70)",
           "phase_protocol":"Info.cfg 1-based indices; NIfTI frame verified by 3D NCC; signed phase offsets",
           "consistency_scope":"target-aligned ED/ES probe agreement; NOT unlabeled target-frame learning",
-          "temporal_preflight":"strict-cine-ed-es-v2"}
-    (out_dir/"run_config.json").write_text(json.dumps(meta,indent=2),encoding="utf-8")
+          "temporal_preflight":"strict-cine-ed-es-v2",
+          "num_workers":num_workers, "save_every":save_every,
+          "checkpoint_kind":CHECKPOINT_KIND,
+          "acdc_root":str(acdc_root.resolve()),
+          "pulse_root":str(pulse_root.resolve()),
+          "source_hashes":{
+              "cine_data":_sha256(Path(__file__).parent/"cine_data.py"),
+              "cine_v2":_sha256(Path(__file__).parent/"cine_v2.py"),
+              "pulse":_sha256(pulse_root/"pulse"/"pulse_seg.py")}}
+    if resume:
+        recorded = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if recorded != meta:
+            raise ValueError("Original V2 run config differs; resume refused")
+    else:
+        _atomic_json(meta, cfg_path)
     print("TRAIN",len(trainset),"slices VAL",len(valset),"device",device,
           "total_parameters",sum(p.numel() for p in model.parameters()),
           "trainable_parameters",sum(p.numel() for p in model.parameters() if p.requires_grad),
           flush=True)
-    best=-1;history=[];unfroze=False;clock=time.perf_counter()
+    best=-1;history=[];unfroze=False;start_epoch=1;clock=time.perf_counter()
+    if resume:
+        ck = torch.load(state_path, map_location="cpu", weights_only=True)
+        last = _check_resume(ck, meta, best_path)
+        if last > pulse.STAGE1:
+            _unfreeze_stage2(blocks, frozen_count, optimizer, pulse)
+            unfroze = True
+        model.load_state_dict(ck["model"], strict=True)
+        optimizer.load_state_dict(ck["optimizer"])
+        scaler.load_state_dict(ck["scaler"])
+        history = list(ck["history"])
+        best = float(ck["best_dice"])
+        best_ck = torch.load(best_path, map_location="cpu", weights_only=True)
+        if best_ck.get("variant") != VARIANT or best_ck.get("fold") != fold:
+            raise ValueError("Existing best_model variant/fold does not match")
+        best = max(best, float(best_ck["best_dice"]))
+        _restore_rng(ck["rng"])
+        start_epoch = last + 1
+        print(f"[RESUME V2] epoch {last} -> {start_epoch}; full optimizer/scaler/RNG restored",flush=True)
+    else:
+        print(f"[FRESH V2] epochs 1..{epochs}; full-state checkpoint every {save_every}",flush=True)
     try:
-        for epoch in range(1,epochs+1):
+        for epoch in range(start_epoch,epochs+1):
             if epoch==pulse.STAGE1+1 and not unfroze:
-                new=[]
-                for block in blocks[:frozen_count]:
-                    for p in block.parameters():
-                        p.requires_grad_(True);new.append(p)
-                optimizer.add_param_group({"params":new,"lr":pulse.STAGE2_LR*.05})
+                _unfreeze_stage2(blocks, frozen_count, optimizer, pulse)
                 unfroze=True
+                print("[STAGE2 V2] early backbone blocks unfrozen",flush=True)
             pulse.set_lr(optimizer,epoch-1,lr,pulse.STAGE2_LR)
             model.train();running=[];tic=time.perf_counter()
             for i,b in enumerate(tqdm(trainloader,desc=f"CineV2 ep{epoch}",leave=False)):
@@ -181,7 +303,7 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
                     "val_LV":float(mean_classes[2]),"val_mean":val,
                     "elapsed_sec":round(time.perf_counter()-tic,2)}
             history.append(record)
-            (out_dir/"history.json").write_text(json.dumps(history,indent=2),encoding="utf-8")
+            _atomic_json(history, out_dir/"history.json")
             if val>best:
                 best=val
                 checkpoint={"variant":"cine-reliability-v2","epoch":epoch,
@@ -190,9 +312,18 @@ def run(acdc_root: Path, pulse_root: Path, out_dir: Path,
                             "use_consistency":use_consistency,
                             "use_probe_supervision":use_probe_supervision,
                             "protocol_version":"audited-directional-v2"}
-                tmp=out_dir/"best_model.part"
-                torch.save(checkpoint,tmp)
-                os.replace(tmp,out_dir/"best_model.pth")
+                _atomic_torch_save(checkpoint, best_path)
+            # Capture RNG at the completed epoch boundary, after validation.
+            if epoch % save_every == 0 or epoch == epochs:
+                full = {"checkpoint_kind":CHECKPOINT_KIND,
+                        "variant":VARIANT, "epoch":epoch,
+                        "model":model.state_dict(),
+                        "optimizer":optimizer.state_dict(),
+                        "scaler":scaler.state_dict(), "rng":_rng_state(),
+                        "history":history, "best_dice":best,
+                        "run_config":meta}
+                _atomic_torch_save(full, state_path)
+                print(f"[FULL STATE] epoch {epoch} saved: {state_path}",flush=True)
             print(f"Ep{epoch:03d} loss={record['loss']:.4f} | RV={mean_classes[0]:.4f} "
                   f"Myo={mean_classes[1]:.4f} LV={mean_classes[2]:.4f} "
                   f"mean={val:.4f} best={best:.4f}",flush=True)
@@ -224,6 +355,8 @@ def main():
     p.add_argument("--consistency-weight",type=float,default=.05)
     p.add_argument("--probe-weight",type=float,default=.1)
     p.add_argument("--num-workers",type=int,default=2)
+    p.add_argument("--save-every",type=int,default=2)
+    p.add_argument("--resume",action="store_true")
     p.add_argument("--max-steps",type=int,default=None,
                    help="SMOKE TEST ONLY, not a full training result")
     a=p.parse_args();run(**vars(a))
