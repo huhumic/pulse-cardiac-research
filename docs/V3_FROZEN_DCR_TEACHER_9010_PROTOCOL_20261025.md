@@ -207,3 +207,19 @@ Added experimental `pulse_repro/v3_pseudo_cache.py` and `tests/test_v3_pseudo_ca
 B5 control: raw hard NN consensus and valid mask. B6 candidate: same mask with classwise median-normalized mean ED/ES warped-image residual against real target. This is **relative residual weight, not calibrated probability**; avoid calling method validated novel until matched B5/B6 student training results are available. Class-balanced pseudo CE normalizes class-weighted losses across present classes and ignores 255; it is pure code only, student integration still pending. Need explicit teacher UVI grid→native NIfTI 2.5D student slice resize to 256x256 for PULSE; never treat 128x128x32 as PULSE B3HW images or flip native axes based solely on header.
 
 Next: run 6 CPU tests on target then optional three-patient CUDA cache generation. If all pass, GPU can be shut down while the native-grid→PULSE student adapter is implemented. Never reuse Fold0 80/20 student checkpoints on 90/10 V3.
+
+### G2 three-case cache pass and PULSE student native 2.5D bridge
+
+User's target RTX3090 result from `tests/test_v3_pseudo_cache.py`: **7 passed in 1.98s**; `python -m pulse_repro.v3_pseudo_cache ... --patients patient001 patient002 patient003` finished `G2_CANDIDATE_CACHE_PASS 3 training-only samples`, exit code 0. Outputs stored `/root/autodl-tmp/v3_candidate_cache_g2_20261025/` with `.npz` and SHA JSON. Per-patient results:
+
+| Patient | Frame | tau | Consensus fraction of measured | RV pairwise Dice | Myo | LV | candidate NPZ SHA256 |
+|---|---:|---:|---:|---:|---:|---:|---|
+|001|6|0.454545|0.951239|0.622621|0.793195|0.937206|`9388a24fa854afc3449e9ff455070c574b91f870db22c8b1adb25aae9a63f5fe`|
+|002|6|0.454545|0.942175|0.465622|0.743669|0.893856|`be3f0c2c3be553e8f6c4da5b1b8fa6d769a62002c669f5270113230cf7b0da77`|
+|003|8|0.5|0.969452|0.895495|0.851173|0.947001|`4c2c778bec7e95b142130d70a5e80ac97d4def5ac77f49cb10a697870c4b6e84`|
+
+Per-class mean relative image reliability weights were around 0.37–0.41 across all three cases. This is **not probability calibration**; pseudolabel consensus includes much background. Only 3 candidate training samples; no new PULSE segmentation model run and no formal ablations performed.
+
+Added `pulse_repro/v3_student_adapter.py` and `tests/test_v3_student_adapter.py` (new code **NOT YET EXECUTED ON TARGET**). Bridge verifies NPZ SHA and provenance, 90/10 train-only, exact UVI grid mask geometry, label ignore 255, inverse-crops teacher labels back to original native NIfTI [native_axis0,native_axis1,native_axis2] leaving unseen FOV `255`, confidence=0 outside FOV, then NN-resizes label and confidence to PULSE `256×256` pixels per native slice. Student input comes from existing `cine_data.build_temporal_input`: spatial neighboring Z slices `[3,256,256]`, distinct real temporal neighbors `[2,256,256]`, and `phase_context` as original. Train 2D CE accepts `[B,4,256,256]` student logits, ignore=255. Only G2 1–3 training patients; no official validation split contamination.
+
+**Next acceptance:** 5 CPU tests and real 3-patient `CandidateStudentDataset` loader smoke. GPU unnecessary; after this acceptance GPU can be stopped. Formal 90/10 training runner and matching B0/B5/B6 ablations remain to be implemented. In particular, synchronized augmentation between student input and pseudo labels is still absent (do not silently use old V2 augmentation independently), and original full-FOV PULSE supervised ED/ES should be maintained in future student objective.
