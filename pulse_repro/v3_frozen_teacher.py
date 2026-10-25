@@ -56,7 +56,12 @@ class TeacherAssets:
 
     @property
     def source(self) -> Path:
-        return self.imported_root / "source"
+        imported = self.imported_root / "source"
+        if (imported / "research_modules").is_dir():
+            return imported
+        if (self.imported_root / "research_modules").is_dir():
+            return self.imported_root
+        return imported
 
     def audit_file_provenance(self) -> dict:
         """No weight unpickling and no GPU. Refuse mismatched E100->E50 pair."""
