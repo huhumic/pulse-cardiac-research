@@ -75,6 +75,54 @@ def _compare_training_cache(cache_root: Path, patient: str, pair) -> dict:
     return {"checked": True, **differences}
 
 
+
+def structural_agreement_diagnostic(propagation) -> dict:
+    """Measure agreement for RV/Myo/LV separately; never call it accuracy.
+
+    Class statistics are restricted to pixels where BOTH endpoint pull-backs
+    sample an originally measured (not padded) voxel. Background prevalence
+    therefore cannot inflate class-specific metrics.
+    """
+    import torch
+    both = propagation.ed_valid & propagation.es_valid
+    ed = propagation.ed[both].long()
+    es = propagation.es[both].long()
+    confusion = torch.bincount(ed * 4 + es, minlength=16).reshape(4, 4)
+    total_both = int(both.sum().item())
+    diagonals = int(confusion.diag().sum().item())
+    fg_any = total_both - int(confusion[0, 0].item())
+    fg_agree = int(confusion[1, 1].item() + confusion[2, 2].item()
+                   + confusion[3, 3].item())
+
+    classes = {}
+    for name, idx in (("RV", 1), ("Myo", 2), ("LV", 3)):
+        n_ed = int(confusion[idx, :].sum().item())
+        n_es = int(confusion[:, idx].sum().item())
+        inter = int(confusion[idx, idx].item())
+        denom = n_ed + n_es
+        union = n_ed + n_es - inter
+        classes[name] = {
+            "ed_propagated_voxels_both_valid": n_ed,
+            "es_propagated_voxels_both_valid": n_es,
+            "both_agree_voxels": inter,
+            "pairwise_dice_not_gt": float(2 * inter / denom) if denom else None,
+            "pairwise_iou_not_gt": float(inter / union) if union else None,
+        }
+
+    return {
+        "both_endpoint_valid_voxels": total_both,
+        "agreement_all_classes_in_both_valid": (
+            float(diagonals / total_both) if total_both else None
+        ),
+        "foreground_union_voxels": fg_any,
+        "foreground_agree_voxels": fg_agree,
+        "foreground_agreement_given_either_foreground": (
+            float(fg_agree / fg_any) if fg_any else None
+        ),
+        "classes": classes,
+        "meaning": "Agreement of two warped endpoint labels; no intermediate GT or Dice accuracy",
+    }
+
 def run(raw_patient: Path, dcr_root: Path, frame1: int,
         report: Path | None = None) -> dict:
     import nibabel as nib
@@ -147,6 +195,7 @@ def run(raw_patient: Path, dcr_root: Path, frame1: int,
         ed_mae = float((w0-t).abs()[measured].mean().item())
         es_mae = float((w1-t).abs()[measured].mean().item())
         pseudo = forward["labels"]
+        structure = structural_agreement_diagnostic(pseudo)
         valid_pixels = int(pseudo.agreement.sum().item())
         valid_fraction_of_measured = float(valid_pixels / max(1, int(measured.sum().item())))
         label_hist = {
@@ -169,6 +218,7 @@ def run(raw_patient: Path, dcr_root: Path, frame1: int,
             "ed": ed_mae, "es": es_mae,
         },
         "propagation": pseudo.summary(),
+        "structure": structure,
         "hard_agreement_fraction_of_measured": valid_fraction_of_measured,
         "hard_pseudo_class_voxels": label_hist,
         "device": gpu, "cuda_peak_MB": round(torch.cuda.max_memory_allocated()/2**20, 1),
@@ -202,6 +252,11 @@ def main() -> None:
         "cache_comparison": result["historical_cached_endpoints"],
         "endpoint_mae": result["warped_endpoint_vs_real_target_MAE_measured_only"],
         "propagation": result["propagation"],
+        "foreground_agreement": result["structure"]["foreground_agreement_given_either_foreground"],
+        "classwise_pair_dice_not_gt": {
+            k: v["pairwise_dice_not_gt"]
+            for k, v in result["structure"]["classes"].items()
+        },
         "hard_agreement_fraction_of_measured": result["hard_agreement_fraction_of_measured"],
         "cuda_peak_MB": result["cuda_peak_MB"],
     }, indent=2))
