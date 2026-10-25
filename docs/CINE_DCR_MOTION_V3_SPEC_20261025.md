@@ -1,5 +1,7 @@
 # V3 设计规格（设计冻结候选）：双向运动可靠性约束的 Cine MRI 时序分割
 
+> **2026-10-25 协议更新：用户选择复用现有 DCR-MI ACDC checkpoint、不重训练 DCR；分割端重新训练。当前优先协议为 [V3_FROZEN_DCR_TEACHER_9010_PROTOCOL_20261025.md](./V3_FROZEN_DCR_TEACHER_9010_PROTOCOL_20261025.md)。下文 80/20 Fold0 + fold-specific teacher 方案保留为历史设计备选，不能再当作当前默认执行协议。**
+
 状态：**DESIGN ONLY / NOT APPROVED FOR TRAINING**  
 日期：2026-10-25  
 基础分支：`feature/cine-fullvolume-validation-20261025`  
