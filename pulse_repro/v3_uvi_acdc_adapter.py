@@ -182,6 +182,38 @@ def prepare_endpoints(ed_image: np.ndarray, es_image: np.ndarray,
     return TeacherEndpoints(ed, es, y0, y1, valid, grid, mode)
 
 
+
+def prepare_target_frame(frame: np.ndarray, *, mode: Mode,
+                         grid: UVIGrid | None = None) -> np.ndarray:
+    """Get one real unlabeled intermediate Cine frame in exactly teacher space."""
+    if mode == "raw_uvi":
+        if grid is None:
+            raise ValueError("Raw Cine requires the ED/ES native-grid transform")
+        return _normalise_raw_uvi(grid.forward(frame))
+    if mode == "already_uvi":
+        if grid is not None and frame.shape == grid.native_shape:
+            raise ValueError("Raw-sized Cine frame passed as already_uvi")
+        return validate_already_uvi(frame)
+    raise ValueError(f"Invalid input mode {mode!r}")
+
+
+def model_endpoints(pair: TeacherEndpoints) -> np.ndarray:
+    """FR-BME expects [B,2,D,H,W], not [B,2,C,D,H,W]."""
+    x = np.stack([pair.ed_image, pair.es_image], axis=0)[None]
+    assert x.shape == (1, 2, *TEACHER_SHAPE)
+    return np.ascontiguousarray(x, dtype=np.float32)
+
+
+def split_role(pid: str) -> str:
+    """Explicit UVI-aligned 90/10 guard, not the old PULSE Fold0 80/20."""
+    if not (pid.startswith("patient") and len(pid) == 10 and pid[7:].isdigit()):
+        raise ValueError(f"Invalid ACDC patient name: {pid!r}")
+    number = int(pid[7:])
+    if not 1 <= number <= 100:
+        raise ValueError(f"Unexpected ACDC training-database patient: {pid}")
+    return "train" if number <= 90 else "validation"
+
+
 def read_info_cfg(path: Path) -> dict[str, int]:
     text = Path(path).read_text(encoding="utf-8")
     vals: dict[str, int] = {}
