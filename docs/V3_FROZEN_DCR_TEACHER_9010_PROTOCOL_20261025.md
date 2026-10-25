@@ -62,3 +62,18 @@
 **可行：冻结 DCR-MI + 重新训练 90/10 分割。** 现有代码 `train_cine_v2.py` 和 `evaluate_cine_v2.py` 目前硬编码 Fold0 的 stratified 80/20，故需要建立**独立新的 V3/split adapter 与 evaluation runner**，不能只往旧 CLI 传 `--fold 0` 就实现 90/10。
 
 旧 80/20 E91 权重保留为诊断基线，不能在新协议作为无泄漏初始化。
+
+## 8. 2026-10-25 冻结投稿证据：正式 DCR-MI 是两份权重
+
+通过用户私有仓库 `huhumic/4d-lung-motion` 的 `dcrmi-submission-frozen-20260830` 分支：`reports/submission_experiments/acdc_heldout101_150_frozen_v2/CHECKPOINTS.json` 和 `run_manifest.json`，直接确认：
+
+| role | canonical path (project/checkpoints 下) | SHA256 |
+| --- | --- | --- |
+| `dcr_motion` | `frbme_acdc_4090_formal/best_psnr.pth` | `ea1889917dd4bcf3180dbaaded02345686e63b24c9863349649200910de5bdda` |
+| `dcr_refiner` | `mgrr_protocol_confirmation100/acdc/best/best_psnr.pth` | `0152096dd6452f94ef75b43a2c9e4bcdc7c7bfdee5276a9d04d8953cb7a5da3c` |
+
+投稿冻结记录证明正式 DCR-MI 是 FR-BME 前端 + frozen MGRR E77 后端的**两件套**。 `dcrmi_front_ablation250/acdc/...` 不属于正式完整组合；`relation_reliability_ablation_...` 不得替代已冻结的正式身份。上游`research_modules/frbme/refinement.py` 明确 MGRR 只修正合成强度，不预测/修改位移场：V3 标签传播首先应核验 FR-BME 的目标状态运动场，不能从 MGRR 图像残差虚构 flow。
+
+源服务器用户列出目录 `frbme_acdc_4090_formal`，但尚未独立运行磁盘 `sha256sum` 验证。 `mgrr_protocol_confirmation100` 未被用户先前关键词为 ACDC/DCR 的顶层目录枚举覆盖，**不代表不存在**。必须两个都在源磁盘存在、SHA 匹配；传目标服务器时以角色分别命名/分目录，避免 `best_psnr.pth` 同名冲突。
+
+**状态仍为需实机检查**：源文件 SHA、目标传输完成与双源 checkpoint load/flow contract。不能声称已经完成拷贝。
