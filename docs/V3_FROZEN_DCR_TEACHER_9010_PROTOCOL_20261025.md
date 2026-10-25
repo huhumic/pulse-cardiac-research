@@ -1,12 +1,12 @@
 # V3 新方案：冻结 DCR-MI 既有 ACDC 权重，重新训练分割（UVI-aligned 90/10）
 
-状态：**协议决定已确认，DCR checkpoint/export interface 仍需 G0 核查；尚未启动训练**  
+状态：**E50/E100 权重迁移/CPU strict-load 与合成 flow 几何已通过；新版 V3 数据适配器已提交，等待 AutoDL 测试与真实数据验证；未启动训练**  
 日期：2026-10-25  
 分支：`feature/cine-dcr-motion-v3-spec-20261025`  
 **此文是 V3 当前优先执行的协议，替代此前规格中“在 PULSE 80/20 Fold0 上必须重训 DCR-MI teacher”的默认路径；此前 80/20 对照结果保留作为历史研究证据。**
 
 ## 1. 用户明确决定
-- DCR-MI **不重新训练**，直接读取第一篇已有的 ACDC best checkpoint；全程冻结，记录 SHA。
+- DCR-MI **不重新训练**，使用已迁移的固定 E50 前端与固定 E100 后端候选 checkpoint（不是历史 best 模型），全程冻结并记录 SHA；最终论文主实验 checkpoint 身份仍待核验。
 - 心脏分割网络可从头重新训练；严禁把旧 V1 E95、V1.5 E84、V2 E91、PULSE 在 80/20 Fold0 训练的 checkpoint 直接热启动进新的 90/10 实验。理由：那些分割 checkpoint 的训练集包含新的 90/10 验证患者 `patient091,092,094,096,097,098,100`（7 例），属于已知直接监督交集。
 - 新的 V3 主协议按 UVI-Net ACDC 目录默认 split=90 对齐：`patient001..090` 训练；`patient091..100` 验证。已确认 AutoDL 目录有 `MANDATORY_CITATION.md` 排在 patient001 之前，且 UVI 默认 `[1:91]` / `[91:]` 为 90/10。
 - 若有模型在 90/10 的末 10 人上**用于选取 DCR-MI checkpoint（以 NCC 验证）**，这十人仍是模型选择验证集，不是完全 untouched independent test。研究报告需披露；最终泛化结论需要另一个独立有标签 cohort/外部数据，不能把该 10 人称为 independent test。
@@ -79,7 +79,7 @@
 
 尤其注意目录 `relation_reliability_ablation_acdc_full_acdc_frE050_seed12345` 等虽然是**潜在候选**，但名称 `full` 与 `frE050` 不能替代内部来源证据；不经过审计不能直接判为正式主实验。
 
-**G0 checkpoint identity: PENDING。训练数据划分 90/10 已核验；权重传输：未执行。**
+**历史节点说明：该条记录时尚未传输；现已在后续章节记录迁移成功、CPU 严格加载通过，论文主表精确来源仍待核验。**
 ## 9. 2026-10-25 第二台服务器实测迁移状态
 
 用户在源服务器完成 ACDC 固定 E50 + E100 candidate 两文件打包并用 SCP 上传到目标服务器；源端压缩包 SHA256 与目标端验证 `sha256sum -c` 一致，目标端输出 `TRANSFER VERIFIED`。目标机 CPU-only 解压验收输出：
@@ -148,3 +148,13 @@ Next gate: locate and inspect the **exact current** UVI ACDC dataset processor u
 - The user reports having used **already preprocessed** ACDC inputs. Do not preprocess 128x128x32 inputs again. The inspected on-disk `datasets/ACDC/database/training/patient001` contains raw 216x256x10 files, so that path cannot by itself prove the actual historical DCR trained on saved preprocessed tensors vs online loader. Determine actual source in the migrated `train_rbme_frbme_acdc_uvi_style.py` / dataset path once at adapter integration. The public repo is a reference, not proof of the private training implementation.
 - User also reported native Cine direct-array ED/ES Pearson correlation 1.0, while affine-based axis flip sharply lowered the correlation; do not flip arrays based solely on LAS-vs-LPS header labels. Correlation 1.0 is not proof of byte-for-byte equality.
 - Source repository README's preprocessed dataset release specifically describes 4D-Lung; ACDC raw-layout instructions are separate: `https://github.com/jungeun122333/UVI-Net/blob/main/README.md`.
+
+### V3 ACDC data adapter implementation (2026-10-25)
+
+In branch `feature/cine-dcr-motion-v3-spec-20261025`, new isolated, GPU-free files are now committed:
+
+- `pulse_repro/v3_uvi_acdc_adapter.py`: explicit `raw_uvi` (exact official ACDC array center-crop/depth-pad, single-frame minmax) and `already_uvi` (preserve preprocessed 128x128x32 intensities) modes; image/GT alignment, reversibility limits/valid mask, strict ED–ES forward arc, split guard and read-only original patient inspection.
+- `tests/test_v3_uvi_acdc_adapter.py`: synthetic spatial/label/phase/identity-input tests; **created, not yet run on user's AutoDL**.
+- `docs/V3_UVI_ACDC_ADAPTER_USAGE_20261025.md`: independent clone and CPU-only verification commands.
+
+Official `UVI-Net/README.md` describes revised old/new released *preprocessed 4D-Lung* data; it does NOT document two specific ACDC preprocessing variants. User says likely used old UVI processing; do not assume a newer ACDC normalization/crop. Source files in target server are original NIfTI, so historical checkpoint training input identity remains unverified. The code is a safe compatibility adapter rather than proof that teacher training data preprocessing already matches the chosen branch. Any `already_uvi` array requires matched preprocessed GT and input provenance; do not double-normalize or auto-reorient. Next gate is read-only AutoDL pytest + patient001 output, then teacher source / 4D time correspondence and real-case pilot; do not train.
