@@ -80,3 +80,15 @@
 尤其注意目录 `relation_reliability_ablation_acdc_full_acdc_frE050_seed12345` 等虽然是**潜在候选**，但名称 `full` 与 `frE050` 不能替代内部来源证据；不经过审计不能直接判为正式主实验。
 
 **G0 checkpoint identity: PENDING。训练数据划分 90/10 已核验；权重传输：未执行。**
+## 9. 2026-10-25 第二台服务器实测迁移状态
+
+用户在源服务器完成 ACDC 固定 E50 + E100 candidate 两文件打包并用 SCP 上传到目标服务器；源端压缩包 SHA256 与目标端验证 `sha256sum -c` 一致，目标端输出 `TRANSFER VERIFIED`。目标机 CPU-only 解压验收输出：
+
+- `checkpoints/frbme_acdc_4090_formal/epoch_050.pth`: 10,840,050 bytes, present。
+- `checkpoints/relation_reliability_ablation_acdc_full_acdc_frE050_seed12345/epoch_100.pth`: 451,786 bytes, SHA256 `6e198ceff0e587d9d7c5e7aa08d6c551caa3fdbe1ad4de3c3c9895fc4e8dc5e5` PASS。
+- `reports/relation_reliability_ablation_acdc_full_acdc_frE050_seed12345/manifest.json`: 3,253 bytes, `fr_checkpoint` 指向上述 FR E50；`structural_variant: full`, `dataset: acdc`, E100 training, `seed: 0`。
+- 文件落地目录：`/root/autodl-tmp/pulse_results/dcrmi_acdc_import`，保留打包的原相对路径。
+
+**特别注意**：该源端 manifest 仍包含 `checkpoint_selection: best monitored PSNR among E1..E100`，意味着该训练过程原始记录存在 validation-based best 模型选择；在 V3 我们明示使用 **固定 E100 文件**，不能将该 manifest 的 best-PSNR 结果冒充 fixed-E100 的论文指标。论文终稿 E50+E100 规则与具体单份权重产生的主表仍需代码/评估结果双向核实。
+
+G0 传输和依赖清单：PASS；GPU 是否存在与文件完整性无关。FR-E50 独立 SHA256、两权重安全反序列化、完整模型严格 state_dict 加载、实际位移场返回形状/方向/单位、真实 ACDC replay：**尚未执行**。代码仍应从源服务器当前文件复制，因为现有 GitHub 分支已过时。不得声称模型部署成功。
