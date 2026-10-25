@@ -221,8 +221,8 @@ class FrozenFRBMETeacher:
         # The user's own trusted training checkpoints may contain non-tensor
         # metadata. DO NOT enable weights_only=False for untrusted inputs.
         state = torch.load(assets.front, map_location="cpu", weights_only=False)
-        if state.get("model_kind") not in ("frbme", "FRBME"):
-            raise ValueError(f"Unexpected FR checkpoint model_kind={state.get('model_kind')!r}")
+        # Strict state_dict loading validates the exact instantiated architecture.
+        # Do not restrict the training-script-specific model_kind spelling here.
         cfg = module.FRBMEConfig(**state["model_config"])
         if tuple(cfg.inshape) != TEACHER_SHAPE:
             raise ValueError(f"Teacher checkpoint requires unexpected shape: {cfg.inshape}")
