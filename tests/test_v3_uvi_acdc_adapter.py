@@ -6,7 +6,8 @@ import pytest
 
 from pulse_repro.v3_uvi_acdc_adapter import (
     TEACHER_SHAPE, UVIGrid, ed_to_es_tau,
-    prepare_endpoints, read_info_cfg, validate_already_uvi,
+    prepare_endpoints, prepare_target_frame, model_endpoints, split_role,
+    read_info_cfg, validate_already_uvi,
 )
 
 
@@ -112,3 +113,29 @@ def test_fail_closed_on_corrupted_labels_and_dimensions():
     assert grid.start0 == 0 and grid.start1 == 0 and grid.start2 == 0
     with pytest.raises(ValueError, match="Unsupported native shape"):
         UVIGrid.for_native_shape((100, 256, 10))
+
+
+
+def test_target_frame_matches_endpoint_grid_and_split_guard():
+    source_shape = (128, 128, 10)
+    grid = UVIGrid.for_native_shape(source_shape)
+    raw = np.zeros(source_shape, dtype=np.float32)
+    raw[10, 20, 3] = 5.
+    labels = np.zeros(source_shape, dtype=np.uint8)
+    pair = prepare_endpoints(raw, raw, labels, labels, mode="raw_uvi")
+    x = model_endpoints(pair)
+    assert x.shape == (1, 2, *TEACHER_SHAPE)
+    target = prepare_target_frame(raw, mode="raw_uvi", grid=grid)
+    np.testing.assert_array_equal(target, pair.ed_image)
+    already = np.full(TEACHER_SHAPE, .37, dtype=np.float32)
+    np.testing.assert_array_equal(
+        prepare_target_frame(already, mode="already_uvi"), already
+    )
+    with pytest.raises(ValueError, match="requires"):
+        prepare_target_frame(raw, mode="raw_uvi")
+    assert split_role("patient001") == "train"
+    assert split_role("patient090") == "train"
+    assert split_role("patient091") == "validation"
+    assert split_role("patient100") == "validation"
+    with pytest.raises(ValueError):
+        split_role("patient101")
