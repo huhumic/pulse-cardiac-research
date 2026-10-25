@@ -31,6 +31,22 @@
 
 **决策**：即使 DCR-MI 在训练中只看到这 17 人的无标签 ED/ES，也不符合 V3 患者独立 teacher 实验预期。不得将该旧 teacher 的伪标签/流场混入训练并据此声称 Fold0 严格独立。
 
+
+## 2.1 AutoDL 真实目录复核（用户于 2026-10-25 运行）
+
+```text
+ACDC directory first entries: ['MANDATORY_CITATION.md', 'patient001', 'patient002', 'patient003', 'patient004']
+UVI train entries: 90
+UVI validation entries: 10
+PULSE Fold0 train: 80
+PULSE Fold0 validation: 20
+Overlap count: 17
+Overlapping patients: ['patient014', 'patient017', 'patient018', 'patient020', 'patient023', 'patient028', 'patient035', 'patient037', 'patient042', 'patient046', 'patient047', 'patient050', 'patient065', 'patient071', 'patient072', 'patient080', 'patient089']
+Non-overlapping patients: ['patient093', 'patient095', 'patient099']
+```
+
+**此条已由用户实际运行脚本确认**：当前 ACDC 目录包含排序在 patient001 之前的 `MANDATORY_CITATION.md`，因此 UVI 默认 train/val 精确对应 patient001..090 / patient091..100（基于当前目录及 UVI 代码）。两模型数据划分存在 17 名患者交集已确证；对于历史 DCR-MI checkpoint 的实际患者 provenance 仍须单独核查，不能将目录复核替代 checkpoint 来源证据。
+
 ## 3. 已核实：UVI warp 的几何语义，但不能直接当 DCR-MI 定义
 
 上游 `utils/utils.py:SpatialTransformer` 与 `models/VoxelMorph/model.py` 使用 `new_locs = grid + flow`、normalized grid [-1,1]、`align_corners=True`、3D 分量末尾 `[..., [2,1,0]]` 后传入 `grid_sample`。因此 UVI 的 flow 在其 native `128×128×32` 张量索引网格中以**voxel/grid-index displacement** 使用，具备 pull-back sampling 形式，并**非直接毫米 DVF**；轴顺序必须根据 native image layout 做显式转换。实现需要确认 `flow_0_1` 对应从 I0 重采样到 I1 的输出目标网格，不能仅凭名字认为是 push-forward ED->ES。
