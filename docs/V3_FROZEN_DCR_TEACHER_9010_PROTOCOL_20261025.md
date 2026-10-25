@@ -107,3 +107,13 @@ On target CPU-only environment, user ran trusted checkpoint `torch.load(..., map
 - Refiner: `StateConditionedRelationReliabilityRefiner(**variant_config)`, strict `back['refiner_model']` loading **PASS**, 25,075 parameters; `variant_config = {'use_relation': True, 'use_warp': True, 'state_conditioned': True}`.
 - Joint parameter total **688,337 = 0.688337 M**. This must be reconciled against reported manuscript size (possible revision/variant difference; do not invent cause). Does not imply the manuscript's fixed E50/E100 checkpoint identities or performance are reproduced.
 - **Next gate:** use transferred source to prove returned flow direction/units, shape and downstream pull-back sampling; then run a real ACDC forward/replay when GPU is available. No training or GPU was used in the strict-load gate.
+
+### Verified frozen FR-BME flow contract (2026-10-25; migrated source)
+
+On the target server the user inspected the **current** `research_modules/rbme/adapters.py` and `research_modules/rbme/rbme.py`:
+
+- `forward(endpoints, t)` expects `endpoints[B,2,D,H,W]` matching `self.config.inshape`; returns `warped_0, warped_1, phi_0t, phi_1t`, where each displacement is `[B,3,D,H,W]`.
+- `VoxelPullbackWarp3D.forward(source, flow_zyx)` computes `locations = identity_zyx_grid + flow_zyx`; reorders normalized coordinates `[..., [2,1,0]]` to PyTorch `xyz` and calls `F.grid_sample(..., align_corners=True)` with default zero padding. Displacement channels mean `dz,dy,dx` **in voxel units** and are **target-grid-to-source sampling offsets**, despite the `phi_0t` naming. Do not invert or swap when propagating endpoint labels.
+- `upsample_voxel_flow` uses trilinear `align_corners=True` followed by per-axis factor `(new_dim-1)/max(old_dim-1,1)` in **zyx order**; applies correct voxel-unit rescaling for normal dimensions greater than one.
+- To propagate ED/ES label volumes already resampled to the teacher's identical input grid, use `VoxelPullbackWarp3D(size, mode='nearest')` separately for `(label_ED,phi_0t)` and `(label_ES,phi_1t)`. Use warped all-ones masks to flag out-of-bounds nearest samples instead of treating padding zeros as actual background. Keep pseudolabels and valid masks distinct. For segmentation CE use ignore_index on invalid pixels. No GPU required for a small synthetic geometry test.
+- Future real-case gate: verify ACDC ED/ES frame order and phase normalization, teacher fixed 128x128x32 geometry (read from checkpoint config rather than assume), segmentation preprocessing/orientation/label alignment, and train/held-out patient split; do not report real-case performance or teacher label correctness based on code-level contract alone.
