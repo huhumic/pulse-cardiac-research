@@ -191,8 +191,6 @@ def prepare_target_frame(frame: np.ndarray, *, mode: Mode,
             raise ValueError("Raw Cine requires the ED/ES native-grid transform")
         return _normalise_raw_uvi(grid.forward(frame))
     if mode == "already_uvi":
-        if grid is not None and frame.shape == grid.native_shape:
-            raise ValueError("Raw-sized Cine frame passed as already_uvi")
         return validate_already_uvi(frame)
     raise ValueError(f"Invalid input mode {mode!r}")
 
