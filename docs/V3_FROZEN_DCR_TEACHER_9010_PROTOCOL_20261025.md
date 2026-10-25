@@ -63,17 +63,20 @@
 
 旧 80/20 E91 权重保留为诊断基线，不能在新协议作为无泄漏初始化。
 
-## 8. 2026-10-25 冻结投稿证据：正式 DCR-MI 是两份权重
+## 8. 2026-10-25 纠错：采用论文固定 Epoch，不采用旧 GitHub best checkpoint
 
-通过用户私有仓库 `huhumic/4d-lung-motion` 的 `dcrmi-submission-frozen-20260830` 分支：`reports/submission_experiments/acdc_heldout101_150_frozen_v2/CHECKPOINTS.json` 和 `run_manifest.json`，直接确认：
+**已撤回前版第 8 节将旧 GitHub `CHECKPOINTS.json` 中 `best_psnr.pth` 定义为“正式 DCR-MI 权重”的断言，也撤回以旧哈希直接传输的命令。不要执行旧命令。**
 
-| role | canonical path (project/checkpoints 下) | SHA256 |
-| --- | --- | --- |
-| `dcr_motion` | `frbme_acdc_4090_formal/best_psnr.pth` | `ea1889917dd4bcf3180dbaaded02345686e63b24c9863349649200910de5bdda` |
-| `dcr_refiner` | `mgrr_protocol_confirmation100/acdc/best/best_psnr.pth` | `0152096dd6452f94ef75b43a2c9e4bcdc7c7bfdee5276a9d04d8953cb7a5da3c` |
+用户明确指出 GitHub `dcrmi-submission-frozen-20260830` 分支已明显滞后。重新核对 2026-10-20 的《DCRMI_EN_Final_v12_Submission_Clean(1).docx》 Section 4.2：TSC-BME motion 前端训练 50 epochs 后冻结，refinement 随后训练 100 epochs；用户确认论文使用固定 E50 前端与 E100 后端，而非对 validation 选择的 `best_psnr`。
 
-投稿冻结记录证明正式 DCR-MI 是 FR-BME 前端 + frozen MGRR E77 后端的**两件套**。 `dcrmi_front_ablation250/acdc/...` 不属于正式完整组合；`relation_reliability_ablation_...` 不得替代已冻结的正式身份。上游`research_modules/frbme/refinement.py` 明确 MGRR 只修正合成强度，不预测/修改位移场：V3 标签传播首先应核验 FR-BME 的目标状态运动场，不能从 MGRR 图像残差虚构 flow。
+因此 V3 要传的是 **同一实验配置/种子的固定 E50 + 固定 E100** 两份权重，是否能在源服务器上组合加载仍须实机验证。旧仓库中 FR-BME best E229 / MGRR best E77 的 checkpoints 和其 SHA 仅能描述旧历史实验，**不得冒充当前论文最终权重或 V3 teacher**。
 
-源服务器用户列出目录 `frbme_acdc_4090_formal`，但尚未独立运行磁盘 `sha256sum` 验证。 `mgrr_protocol_confirmation100` 未被用户先前关键词为 ACDC/DCR 的顶层目录枚举覆盖，**不代表不存在**。必须两个都在源磁盘存在、SHA 匹配；传目标服务器时以角色分别命名/分目录，避免 `best_psnr.pth` 同名冲突。
+在源服务器上要先只读审计：
+1. E50 运动前端的目录、checkpoint 内部 `epoch`/`step`、前端结构变体、seed、数据集 ACDC 90/10；
+2. E100 后端的目录、checkpoint 内部 `epoch`、seed、记录的前端来源路径/hash；
+3. `run_config.json`/`manifest.json`/`progress.json`/训练日志与正式论文 Section 4.2 是否一致；
+4. 模型导出流场的语义/坐标空间，以便未来 V3 训练阶段的标签传播。
 
-**状态仍为需实机检查**：源文件 SHA、目标传输完成与双源 checkpoint load/flow contract。不能声称已经完成拷贝。
+尤其注意目录 `relation_reliability_ablation_acdc_full_acdc_frE050_seed12345` 等虽然是**潜在候选**，但名称 `full` 与 `frE050` 不能替代内部来源证据；不经过审计不能直接判为正式主实验。
+
+**G0 checkpoint identity: PENDING。训练数据划分 90/10 已核验；权重传输：未执行。**
