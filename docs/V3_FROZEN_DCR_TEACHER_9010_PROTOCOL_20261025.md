@@ -96,3 +96,14 @@ G0 传输和依赖清单：PASS；GPU 是否存在与文件完整性无关。FR-
 ### Current source migration (user confirmed)
 
 User executed source-to-target remote transfer on target: tar of `research_modules`, `tools`, `third_party` matching `*.py` from source `/root/autodl-tmp/project` was saved as `/root/autodl-tmp/pulse_results/dcrmi_acdc_import/current_source_py.tar.gz` and extracted to `/root/autodl-tmp/pulse_results/dcrmi_acdc_import/source/`. Shell output: `SOURCE TRANSFER COMPLETE`; `find ... -name '*.py' | wc -l` returned **817**. This is file-transfer/untar evidence only, NOT import/strict model load/flow replay evidence. Non-Python configs and package resources were not included by the transfer filter. Target machine currently has no GPU, so next actions must be CPU-only source / checkpoint structural audit and should print bounded output.
+
+### CPU strict checkpoint load (user confirmed, 2026-10-25)
+
+On target CPU-only environment, user ran trusted checkpoint `torch.load(..., map_location="cpu", weights_only=False)` and constructed models from the **migrated current source**, not the outdated GitHub snapshot:
+
+- Motion checkpoint keys include `model_kind`, `model`, `model_config`, `cursor`, `seed`, `dataset_contract`.
+- Refiner checkpoint keys include `fr_checkpoint`, `fr_cursor`, `fr_model_config`, `fr_frozen`, `refiner_model`, `epoch`.
+- Motion: `FRBME(FRBMEConfig(**front['model_config']))`, strict `front['model']` loading **PASS**, 663,262 parameters. Inherited `forward(endpoints, t, return_trace=False)`.
+- Refiner: `StateConditionedRelationReliabilityRefiner(**variant_config)`, strict `back['refiner_model']` loading **PASS**, 25,075 parameters; `variant_config = {'use_relation': True, 'use_warp': True, 'state_conditioned': True}`.
+- Joint parameter total **688,337 = 0.688337 M**. This must be reconciled against reported manuscript size (possible revision/variant difference; do not invent cause). Does not imply the manuscript's fixed E50/E100 checkpoint identities or performance are reproduced.
+- **Next gate:** use transferred source to prove returned flow direction/units, shape and downstream pull-back sampling; then run a real ACDC forward/replay when GPU is available. No training or GPU was used in the strict-load gate.
