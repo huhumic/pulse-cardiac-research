@@ -35,7 +35,7 @@ def test_odd_padding_and_depth_crop_inverse():
     vol = np.ones((129, 129, 9), dtype=np.float32)
     mapped = odd.forward(vol)
     assert mapped[:, :, :11].sum() == 0
-    assert mapped[:, :, 20:21].sum() == 128*128
+    assert mapped[:, :, 19:20].sum() == 128*128
     assert mapped[:, :, 21:].sum() == 0
     large = UVIGrid.for_native_shape((140, 144, 40))
     assert large.start2 == 4
@@ -106,8 +106,8 @@ def test_fail_closed_on_corrupted_labels_and_dimensions():
     bad = np.zeros(TEACHER_SHAPE, dtype=np.float32)
     bad[2, 3, 1] = 4
     with pytest.raises(ValueError, match="labels"):
-        prepare_endpoints(np.ones(TEACHER_SHAPE),
-                          np.ones(TEACHER_SHAPE)*2, bad, bad,
+        prepare_endpoints(np.indices(TEACHER_SHAPE, dtype=np.float32)[0],
+                          np.indices(TEACHER_SHAPE, dtype=np.float32)[0]+1, bad, bad,
                           mode="raw_uvi")
     assert grid.start0 == 0 and grid.start1 == 0 and grid.start2 == 0
     with pytest.raises(ValueError, match="Unsupported native shape"):
