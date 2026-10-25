@@ -189,3 +189,21 @@ On **target RTX 3090** user executed `python -m pulse_repro.v3_teacher_pilot --p
 - **Crucial**: 96.4% double-valid agreement includes background, and **cannot** be called pseudolabel accuracy or a validation Dice; intermediate target has no GT. Do not gate formal training on this global number alone. Per-class foreground reliability and multiple training patients required next.
 
 Subsequently added class-aware `structural_agreement_diagnostic` to `pulse_repro/v3_teacher_pilot.py` and separate `tests/test_v3_classwise_diagnostics.py`; code is submitted but not yet run on user server. Classwise reports RV/Myo/LV Dice **between two warped endpoint labels only** (not with GT), voxel counts and foreground agreement separate from background, and guards empty-class denominator. Next action is a quick batch pilot for up to three *training* patients, each with a real strictly interior ED→ES frame, using source teacher frozen, and check that structural agreement is not artificially background-dominated. Do not generate formal pseudolabel cache or train segmentation until pilot passes.
+
+### G1 foreground pilot pass and G2 candidate cache implementation
+
+2026-10-25 target GPU follow-up outputs: classwise unit tests **2 passed in 1.84s**. Three training patients with midpoint real Cine frame under frozen E50 returned non-GT pairwise label Dice and foreground agreement:
+
+| Patient | Mid-frame | Foreground agreement | RV pairwise Dice | Myo | LV |
+|--|--:|--:|--:|--:|--:|
+| 001 | 6 | 0.760839 | 0.6226 | 0.7932 | 0.9372 |
+| 002 | 6 | 0.710076 | 0.4656 | 0.7437 | 0.8939 |
+| 003 | 8 | 0.865923 | 0.8955 | 0.8512 | 0.9470 |
+
+**Interpretation:** patient002 RV double-endpoint agreement is weak; high foreground consensus and pairwise Dice do not establish intermediate GT correctness. G1 technical forward is PASS; G1 full quality gate is preliminary only. Do not proceed to 90-patient bulk pseudo-cache or segmentation 120-Epoch training based solely on these 3 cases.
+
+Added experimental `pulse_repro/v3_pseudo_cache.py` and `tests/test_v3_pseudo_cache.py` (NOT yet run on user's server). CLI is intentionally capped at 3 TRAIN patients. Teacher frozen and loaded once, one midpoint time per patient. Output separate `.npz` (`frame_uvi`, `pseudo_uvi` with ignore 255, image-reliability weights, consensus, validity, original ED/ES labels) and SHA-manifest `.json` with source and teacher provenance, native-geometry map, per-class reliability and disagreement. Cache generation fails closed on validation IDs, ED/ES Cine endpoint mismatches, zero consensus, existing outputs. Only candidate cache for student integration, not proof of superiority.
+
+B5 control: raw hard NN consensus and valid mask. B6 candidate: same mask with classwise median-normalized mean ED/ES warped-image residual against real target. This is **relative residual weight, not calibrated probability**; avoid calling method validated novel until matched B5/B6 student training results are available. Class-balanced pseudo CE normalizes class-weighted losses across present classes and ignores 255; it is pure code only, student integration still pending. Need explicit teacher UVI grid→native NIfTI 2.5D student slice resize to 256x256 for PULSE; never treat 128x128x32 as PULSE B3HW images or flip native axes based solely on header.
+
+Next: run 6 CPU tests on target then optional three-patient CUDA cache generation. If all pass, GPU can be shut down while the native-grid→PULSE student adapter is implemented. Never reuse Fold0 80/20 student checkpoints on 90/10 V3.
