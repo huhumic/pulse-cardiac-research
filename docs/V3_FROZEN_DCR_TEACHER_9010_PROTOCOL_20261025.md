@@ -117,3 +117,15 @@ On the target server the user inspected the **current** `research_modules/rbme/a
 - `upsample_voxel_flow` uses trilinear `align_corners=True` followed by per-axis factor `(new_dim-1)/max(old_dim-1,1)` in **zyx order**; applies correct voxel-unit rescaling for normal dimensions greater than one.
 - To propagate ED/ES label volumes already resampled to the teacher's identical input grid, use `VoxelPullbackWarp3D(size, mode='nearest')` separately for `(label_ED,phi_0t)` and `(label_ES,phi_1t)`. Use warped all-ones masks to flag out-of-bounds nearest samples instead of treating padding zeros as actual background. Keep pseudolabels and valid masks distinct. For segmentation CE use ignore_index on invalid pixels. No GPU required for a small synthetic geometry test.
 - Future real-case gate: verify ACDC ED/ES frame order and phase normalization, teacher fixed 128x128x32 geometry (read from checkpoint config rather than assume), segmentation preprocessing/orientation/label alignment, and train/held-out patient split; do not report real-case performance or teacher label correctness based on code-level contract alone.
+
+### Target CPU-only synthetic warp geometry tests: PASS (user output)
+
+User executed the current migrated source `VoxelPullbackWarp3D((5,5,5), mode='nearest')` with synthetic integer label `3` at zyx=(2,2,2) and a one-voxel positive x-channel displacement. Test confirmed expected target coordinate zyx=(2,2,1) maps to source label (2,2,2), destination x=4 is marked out of bounds by warped ones mask, and NN label result contains only the original integer classes. Also confirmed `upsample_voxel_flow` maps constant flow of 1 voxel per channel at 3³ to 2 voxels per channel at 5³. Actual printed results:
+
+```text
+LABEL PULLBACK: PASS
+OUT-OF-BOUNDS MASK: PASS
+VOXEL FLOW UPSAMPLING: PASS
+```
+
+**Scope:** Synthetic voxel geometry stage COMPLETE; no real ACDC patient, real teacher forward, input shape/orientation/crop alignment, image-vs-frame phase mapping, or teacher patient-ID provenance was verified by this unit test. Do not upgrade full G0 or G1 to PASS yet or begin segmentation training until real-case pilot passes. Next step is narrow CPU-only discovery of available ACDC Cine/Info.cfg/segmentation manifest and frozen checkpoint `model_config.inshape`/`dataset_contract` before implementing geometry-preserving adapter.
