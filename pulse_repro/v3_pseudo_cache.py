@@ -50,7 +50,7 @@ def reliability_from_image_residuals(
     if residual_floor <= 0:
         raise ValueError("residual_floor must be positive")
     if target.shape != warped_ed.shape or target.shape != warped_es.shape:
-        raise ValueError("Image tensors must share [B,1,D,H,W]")
+        raise ValueError("Image tensor geometry mismatch: images must share [B,1,D,H,W]")
     if target.ndim != 5 or target.shape[1] != 1 or tuple(target.shape[2:]) != TEACHER_SHAPE:
         raise ValueError("Unexpected 3D teacher image tensor geometry")
     valid = propagation.agreement
@@ -97,14 +97,14 @@ def class_balanced_pseudolabel_ce(
 ) -> torch.Tensor:
     """Average present classes; no foreground drowned by padded background.
 
-    Accepts [B,4,D,H,W] logits, [B,1,D,H,W] labels and weights. Pseudo 255
-    denotes ignore. Works with zero valid pixels and keeps finite zero grads.
+    Accepts [B,4,H,W] or [B,4,D,H,W] logits and aligned B1* labels/weights.
+    Pseudo 255 denotes ignore. Zero valid pixels give finite zero gradients.
     """
     import torch.nn.functional as F
     if not 0 <= background_factor <= 1:
         raise ValueError("background_factor must be between 0 and 1")
-    if logits.ndim != 5 or logits.shape[1] != 4:
-        raise ValueError("Expected segmentation logits B4DHW")
+    if logits.ndim not in (4, 5) or logits.shape[1] != 4:
+        raise ValueError("Expected segmentation logits B4HW or B4DHW")
     wanted = (logits.shape[0], 1, *logits.shape[2:])
     if pseudo.shape != wanted or reliability.shape != wanted:
         raise ValueError("Pseudo and reliability shapes must match logits")
