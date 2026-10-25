@@ -122,6 +122,7 @@ def class_balanced_pseudolabel_ce(
         ignore_index=255, reduction="none",
     )
     components = []
+    coefficients = []
     for class_id in range(4):
         selected = (pseudo[:, 0] == class_id)
         weights = reliability[:, 0] * selected.to(reliability.dtype)
@@ -131,9 +132,10 @@ def class_balanced_pseudolabel_ce(
             factor = background_factor if class_id == 0 else 1.0
             if factor > 0:
                 components.append(class_loss * factor)
+                coefficients.append(factor)
     if not components:
         return logits.sum() * 0.0
-    return torch.stack(components).mean()
+    return torch.stack(components).sum() / sum(coefficients)
 
 
 def _sha256(path: Path) -> str:
