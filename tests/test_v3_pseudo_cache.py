@@ -98,3 +98,16 @@ def test_validation_patient_excluded_by_split_guard():
     assert split_role("patient091") == "validation"
     with pytest.raises(ValueError):
         split_role("patient101")
+
+
+
+def test_pulse_2d_logits_pseudo_ce_support_and_grad():
+    logits = torch.zeros((1, 4, 4, 4), requires_grad=True)
+    pseudo = torch.full((1, 1, 4, 4), 255, dtype=torch.long)
+    reliability = torch.zeros_like(pseudo, dtype=torch.float32)
+    pseudo[0, 0, 1, 2] = 2
+    reliability[0, 0, 1, 2] = 0.8
+    loss = class_balanced_pseudolabel_ce(logits, pseudo, reliability)
+    assert loss.item() == pytest.approx(np.log(4), rel=1e-6)
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
