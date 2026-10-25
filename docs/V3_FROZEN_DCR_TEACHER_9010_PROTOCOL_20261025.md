@@ -92,3 +92,7 @@
 **特别注意**：该源端 manifest 仍包含 `checkpoint_selection: best monitored PSNR among E1..E100`，意味着该训练过程原始记录存在 validation-based best 模型选择；在 V3 我们明示使用 **固定 E100 文件**，不能将该 manifest 的 best-PSNR 结果冒充 fixed-E100 的论文指标。论文终稿 E50+E100 规则与具体单份权重产生的主表仍需代码/评估结果双向核实。
 
 G0 传输和依赖清单：PASS；GPU 是否存在与文件完整性无关。FR-E50 独立 SHA256、两权重安全反序列化、完整模型严格 state_dict 加载、实际位移场返回形状/方向/单位、真实 ACDC replay：**尚未执行**。代码仍应从源服务器当前文件复制，因为现有 GitHub 分支已过时。不得声称模型部署成功。
+
+### Current source migration (user confirmed)
+
+User executed source-to-target remote transfer on target: tar of `research_modules`, `tools`, `third_party` matching `*.py` from source `/root/autodl-tmp/project` was saved as `/root/autodl-tmp/pulse_results/dcrmi_acdc_import/current_source_py.tar.gz` and extracted to `/root/autodl-tmp/pulse_results/dcrmi_acdc_import/source/`. Shell output: `SOURCE TRANSFER COMPLETE`; `find ... -name '*.py' | wc -l` returned **817**. This is file-transfer/untar evidence only, NOT import/strict model load/flow replay evidence. Non-Python configs and package resources were not included by the transfer filter. Target machine currently has no GPU, so next actions must be CPU-only source / checkpoint structural audit and should print bounded output.
